@@ -221,8 +221,25 @@ load manifest"; `just clean-examples` removes them.
   `resourcesOf(mod)`. Worlds without resources do not get any of this, so their
   output is unchanged.
 
-  Not implemented: a resource declared in the world itself, and a record or
-  variant that holds a handle to a resource the guest implements.
+  A record or variant that holds a handle to a resource the guest implements
+  holds the Go handle type. When its interface is also imported, the import
+  side already generated the type under the plain name, so
+  `ExportedResources::types` gives the guest's side an `exported-` name too.
+  Name such a type with `ExportedResources::type_name`, not
+  `qualified_type_name`.
+
+  A resource declared in the world itself is imported from the `$root` module.
+  `analyze_root` (imports.rs) turns the world's own functions and resources
+  into one more `AnalyzedInterface`. A world with world-level functions but no
+  world-level resource still gets no `$root` module.
+
+  A guest handle that the garbage collector frees is queued by
+  `runtime.AddCleanup`, and `dropCollected` runs the destructors at the start
+  of the next export. The cleanup must never call into the module itself: it
+  runs in another goroutine, and an instance is not safe for concurrent use.
+
+  An export that lends a borrowed handle calls `dropBorrows` on the table after
+  `CallWasm` and fails if the guest kept the handle.
 
 ## Key Dependencies
 

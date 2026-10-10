@@ -3,7 +3,9 @@ package resources
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"testing"
+	"time"
 )
 
 // counter is the host's implementation of the `counter` resource.
@@ -47,6 +49,22 @@ func (h *host) Consume(ctx context.Context, c Counter) uint32 {
 	return c.Get(ctx)
 }
 
+// clock is the host's implementation of the `clock` resource, which the
+// world declares itself.
+type clock struct{ now uint32 }
+
+func (c *clock) Tick(ctx context.Context) uint32 {
+	c.now++
+	return c.now
+}
+
+// world implements the world's own imports.
+type world struct{}
+
+func (world) NewClock(ctx context.Context, start uint32) Clock { return &clock{now: start} }
+
+func (world) ReadClock(ctx context.Context, c Clock) uint32 { return c.(*clock).now }
+
 // live returns the number of handles in a table.
 func live[T any](t *resourceTable[T]) int {
 	return len(t.entries) - len(t.free)
@@ -56,7 +74,7 @@ func setup(t *testing.T) (*host, *ResourcesInstance) {
 	t.Helper()
 
 	h := &host{}
-	fac, err := NewResourcesFactory(t.Context(), h)
+	fac, err := NewResourcesFactory(t.Context(), h, world{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +318,7 @@ func TestFallibleGuestResource(t *testing.T) {
 // Every instance has its own handle tables and its own guest resources.
 func TestInstancesAreIsolated(t *testing.T) {
 	h := &host{}
-	fac, err := NewResourcesFactory(t.Context(), h)
+	fac, err := NewResourcesFactory(t.Context(), h, world{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,5 +355,135 @@ func TestInstancesAreIsolated(t *testing.T) {
 	}
 	if got := first.Sum(ctx, acc); got != 1 {
 		t.Errorf("wanted: 1, but got: %d", got)
+	}
+}
+
+// The world declares a resource itself. The guest reaches it and the
+// world-level functions that use it through the `$root` module.
+func TestWorldResource(t *testing.T) {
+	_, ins := setup(t)
+
+	if got := ins.Ticks(t.Context(), 10, 3); got != 13 {
+		t.Errorf("wanted: 13, but got: %d", got)
+	}
+	if n := live(&ins.resources.importedClock); n != 0 {
+		t.Errorf("wanted an empty handle table, but %d handles are live", n)
+	}
+}
+
+// A borrow ends with the call that lent it. A guest that returns while it
+// still holds the handle is trapped, and the handle is taken away.
+func TestKeptBorrowTraps(t *testing.T) {
+	h, ins := setup(t)
+	c := &counter{n: 1, label: "mine", host: h}
+
+	wantPanic(t, "guest keeps a borrowed handle", func() { ins.Forget(t.Context(), c) })
+	if n := live(&ins.resources.importedCounter); n != 0 {
+		t.Errorf("wanted the kept handle to be removed, but %d handles are live", n)
+	}
+	if len(h.dropped) != 0 {
+		t.Errorf("wanted no drops for a borrow, but got: %v", h.dropped)
+	}
+
+	// The instance stays usable.
+	if got := ins.Bump(t.Context(), c); got != 2 {
+		t.Errorf("wanted: 2, but got: %d", got)
+	}
+}
+
+func TestDropBorrows(t *testing.T) {
+	var table resourceTable[string]
+	owned := table.add("owned", true)
+	table.add("borrowed", false)
+	table.add("borrowed too", false)
+
+	if got := table.dropBorrows(); got != 2 {
+		t.Errorf("wanted 2 kept borrows, but got: %d", got)
+	}
+	if got := table.dropBorrows(); got != 0 {
+		t.Errorf("wanted no borrows left, but got: %d", got)
+	}
+	if value, ok := table.get(owned); !ok || value != "owned" {
+		t.Errorf("wanted the owned handle to stay, but got: %q, %v", value, ok)
+	}
+	if n := live(&table); n != 1 {
+		t.Errorf("wanted 1 live handle, but got: %d", n)
+	}
+}
+
+// A handle that is garbage collected without a Drop is destroyed by a later
+// call into the instance.
+func TestCollectedGuestResource(t *testing.T) {
+	_, ins := setup(t)
+	ctx := t.Context()
+
+	// Made in a separate function so that no handle stays on this stack.
+	func() {
+		ins.Make(ctx, "forgotten", 1)
+		ins.NewAccumulator(ctx, "also forgotten")
+	}()
+	kept := ins.Make(ctx, "kept", 2)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for ins.Live(ctx) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("wanted the collected accumulators to be destroyed, but %d are live", ins.Live(ctx))
+		}
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// A handle that is still referenced is not collected, and a handle that
+	// was dropped by hand is not destroyed a second time.
+	if got := kept.Total(ctx); got != 2 {
+		t.Errorf("wanted: 2, but got: %d", got)
+	}
+	if err := kept.Drop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	kept = nil
+	for range 5 {
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := ins.Live(ctx); got != 0 {
+		t.Errorf("wanted no live accumulators, but got: %d", got)
+	}
+}
+
+// A record and a variant carry handles to a resource the guest implements.
+func TestGuestResourceInRecordAndVariant(t *testing.T) {
+	_, ins := setup(t)
+	ctx := t.Context()
+
+	var tagged Tagged = ins.Wrap(ctx, "tag", 4)
+	if tagged.Tag != "tag" {
+		t.Errorf("wanted: tag, but got: %s", tagged.Tag)
+	}
+	var acc *Accumulator = tagged.Acc
+	acc.Add(ctx, 1)
+	if got := ins.Unwrap(ctx, tagged); got != 5 {
+		t.Errorf("wanted: 5, but got: %d", got)
+	}
+	wantPanic(t, "method on a handle given away in a record", func() { acc.Total(ctx) })
+
+	if _, ok := ins.Hold(ctx, 0).(HolderEmpty); !ok {
+		t.Error("wanted an empty holder")
+	}
+	full, ok := ins.Hold(ctx, 9).(HolderFull)
+	if !ok {
+		t.Fatal("wanted a full holder")
+	}
+	if got := full.Value.Total(ctx); got != 9 {
+		t.Errorf("wanted: 9, but got: %d", got)
+	}
+	if got := ins.Weigh(ctx, full); got != 9 {
+		t.Errorf("wanted: 9, but got: %d", got)
+	}
+	if got := ins.Weigh(ctx, HolderEmpty{}); got != 0 {
+		t.Errorf("wanted: 0, but got: %d", got)
+	}
+	if got := ins.Live(ctx); got != 0 {
+		t.Errorf("wanted no live accumulators, but got: %d", got)
 	}
 }

@@ -26,6 +26,22 @@ interface guest {
     combine: static func(a: accumulator, b: borrow<accumulator>) -> accumulator;
   }
 
+  /// A record and a variant that own an accumulator.
+  record tagged {
+    tag: string,
+    acc: accumulator,
+  }
+
+  variant holder {
+    empty,
+    full(accumulator),
+  }
+
+  wrap: func(tag: string, n: u32) -> tagged;
+  unwrap: func(t: tagged) -> u32;
+  hold: func(n: u32) -> holder;
+  weigh: func(h: holder) -> u32;
+
   sum: func(a: borrow<accumulator>) -> u32;
   finish: func(a: accumulator) -> u32;
   make: func(label: string, n: u32) -> accumulator;
@@ -39,6 +55,19 @@ world resources {
   export guest;
 
   use host.{counter};
+
+  /// A resource declared in the world itself, which the host implements.
+  resource clock {
+    constructor(start: u32);
+    tick: func() -> u32;
+  }
+
+  import read-clock: func(c: borrow<clock>) -> u32;
+
+  /// Constructs a clock, ticks it `n` times and reads it.
+  export ticks: func(start: u32, n: u32) -> u32;
+  /// Returns without dropping the borrowed handle, which the host must trap.
+  export forget: func(c: borrow<counter>);
 
   /// Increments a counter the host owns and returns its new value.
   export bump: func(c: borrow<counter>) -> u32;

@@ -17,6 +17,14 @@ interface types-a {
     append: func(s: string);
   }
 
+  /// A record that owns a `foo`. The host's side and the guest's side of it
+  /// hold different Go types.
+  record labeled {
+    label: string,
+    foo: foo,
+  }
+
+  label-foo: func(label: string, x: u32) -> labeled;
   double-foo-x: func(f: borrow<foo>) -> u32;
   make-bar: func(value: string) -> bar;
 }

@@ -96,6 +96,13 @@ impl types_a::Guest for ResourcesWorld {
     type Foo = FooA;
     type Bar = Bar;
 
+    fn label_foo(label: String, x: u32) -> types_a::Labeled {
+        types_a::Labeled {
+            label,
+            foo: types_a::Foo::new(FooA { x: Cell::new(x) }),
+        }
+    }
+
     fn double_foo_x(f: types_a::FooBorrow<'_>) -> u32 {
         f.get::<FooA>().x.get() * 2
     }
@@ -137,6 +144,14 @@ impl Guest for ResourcesWorld {
         let tripled = host_b::triple_baz_count(&baz);
 
         let made = host_b::make_foo("made");
-        format!("{};{};{}", foo_b.get_y(), tripled, made.get_y())
+        let labeled = host_a::label_foo("label", 7);
+        format!(
+            "{};{};{};{}={}",
+            foo_b.get_y(),
+            tripled,
+            made.get_y(),
+            labeled.label,
+            labeled.foo.get_x()
+        )
     }
 }

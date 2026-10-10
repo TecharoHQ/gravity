@@ -8,7 +8,7 @@ use std::cell::{Cell, RefCell};
 
 use arcjet::resources::host;
 use exports::arcjet::resources::guest::{
-    Accumulator, AccumulatorBorrow, Guest as GuestInterface, GuestAccumulator,
+    Accumulator, AccumulatorBorrow, Guest as GuestInterface, GuestAccumulator, Holder, Tagged,
 };
 
 wit_bindgen::generate!({
@@ -74,6 +74,31 @@ impl GuestAccumulator for Acc {
 impl GuestInterface for ResourcesWorld {
     type Accumulator = Acc;
 
+    fn wrap(tag: String, n: u32) -> Tagged {
+        Tagged {
+            acc: Accumulator::new(Acc::with(tag.clone(), n)),
+            tag,
+        }
+    }
+
+    fn unwrap(t: Tagged) -> u32 {
+        t.acc.get::<Acc>().total()
+    }
+
+    fn hold(n: u32) -> Holder {
+        match n {
+            0 => Holder::Empty,
+            n => Holder::Full(Accumulator::new(Acc::with("held".into(), n))),
+        }
+    }
+
+    fn weigh(h: Holder) -> u32 {
+        match h {
+            Holder::Empty => 0,
+            Holder::Full(acc) => acc.get::<Acc>().total(),
+        }
+    }
+
     fn sum(a: AccumulatorBorrow<'_>) -> u32 {
         a.get::<Acc>().total()
     }
@@ -99,6 +124,20 @@ impl GuestInterface for ResourcesWorld {
 }
 
 impl Guest for ResourcesWorld {
+    fn ticks(start: u32, n: u32) -> u32 {
+        let clock = Clock::new(start);
+        for _ in 0..n {
+            clock.tick();
+        }
+        read_clock(&clock)
+    }
+
+    fn forget(c: &Counter) {
+        // Taking the handle out of the binding stops it from dropping the
+        // borrow when this function returns.
+        let _ = c.take_handle();
+    }
+
     fn bump(c: &Counter) -> u32 {
         c.increment();
         c.get()

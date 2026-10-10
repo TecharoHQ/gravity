@@ -10,6 +10,7 @@ use wit_bindgen_core::{
 };
 
 use crate::{
+    ExportedResources,
     codegen::{
         func::Func,
         ir::{
@@ -22,18 +23,32 @@ use crate::{
         GoIdentifier, GoResult, GoType,
         imports::{CONTEXT_CONTEXT, ERRORS_NEW, WAZERO_API_MODULE},
     },
-    resolve_nested_type, resolve_param_type, resolve_type, resolve_wasm_type,
+    resolve_nested_type_in, resolve_param_type, resolve_type, resolve_wasm_type,
 };
 
 /// Analyzer for imports - only does analysis, no code generation
 pub struct ImportAnalyzer<'a> {
     resolve: &'a Resolve,
     world: &'a World,
+    /// The side of the world the analyzed types are seen from. Empty for the
+    /// imports; the export generator sets it to analyze the data types of an
+    /// exported interface.
+    exported: ExportedResources,
 }
 
 impl<'a> ImportAnalyzer<'a> {
     pub fn new(resolve: &'a Resolve, world: &'a World) -> Self {
-        Self { resolve, world }
+        Self {
+            resolve,
+            world,
+            exported: ExportedResources::new(),
+        }
+    }
+
+    /// Analyzes types as the functions of an exported interface see them.
+    pub(super) fn with_exported(mut self, exported: ExportedResources) -> Self {
+        self.exported = exported;
+        self
     }
 
     pub fn analyze(&self) -> AnalyzedImports {
@@ -41,6 +56,10 @@ impl<'a> ImportAnalyzer<'a> {
         let mut interfaces = Vec::new();
         let mut standalone_types = Vec::new();
         let mut standalone_functions = Vec::new();
+        // Functions and resources the world imports directly, outside of
+        // any interface.
+        let mut root_functions = Vec::new();
+        let mut root_resources = Vec::new();
 
         for (_import_name, world_item) in world_imports.iter() {
             match world_item {
@@ -48,8 +67,10 @@ impl<'a> ImportAnalyzer<'a> {
                     interfaces.push(self.analyze_interface(*id));
                 }
                 WorldItem::Type { id: type_id, .. } => {
-                    if matches!(self.resolve.types[*type_id].kind, TypeDefKind::Resource) {
-                        todo!("TODO(#5): implement a resource declared in the world itself");
+                    let type_def = &self.resolve.types[*type_id];
+                    if matches!(type_def.kind, TypeDefKind::Resource) {
+                        let name = type_def.name.clone().expect("resource should have a name");
+                        root_resources.push((name, *type_id));
                     }
                     if let Some(t) = self.analyze_type(*type_id) {
                         standalone_types.push(t);
@@ -57,8 +78,15 @@ impl<'a> ImportAnalyzer<'a> {
                 }
                 WorldItem::Function(func) => {
                     standalone_functions.push(self.analyze_function(func));
+                    root_functions.push(func);
                 }
             }
+        }
+
+        // A resource declared in the world needs a host: its functions are
+        // world-level imports. The guest imports all of them from `$root`.
+        if !root_resources.is_empty() {
+            interfaces.push(self.analyze_root(&root_functions, &root_resources));
         }
 
         // Generate factory-related identifiers
@@ -128,6 +156,59 @@ impl<'a> ImportAnalyzer<'a> {
         })
     }
 
+    /// Analyzes the world's own imports as one more interface for the host
+    /// to implement, served from the `$root` module.
+    ///
+    /// Only a world that declares a resource gets it. The world-level data
+    /// types are already analyzed as standalone types.
+    fn analyze_root(
+        &self,
+        functions: &[&Function],
+        resources: &[(String, TypeId)],
+    ) -> AnalyzedInterface {
+        let methods: Vec<_> = functions
+            .iter()
+            .map(|func| self.analyze_interface_method(func, &self.world.name))
+            .collect();
+        let resources = self
+            .analyze_interface_resources(resources.iter().map(|(name, id)| (name, *id)), &methods);
+        AnalyzedInterface {
+            name: self.world.name.clone(),
+            methods,
+            types: Vec::new(),
+            resources,
+            constructor_param_name: GoIdentifier::private("world"),
+            go_interface_name: GoIdentifier::public(format!("i-{}-world", self.world.name)),
+            wazero_module_name: "$root".to_string(),
+        }
+    }
+
+    /// Analyzes the resources among `types` and attaches each resource's
+    /// methods to it.
+    fn analyze_interface_resources<'t>(
+        &self,
+        types: impl Iterator<Item = (&'t String, TypeId)>,
+        methods: &[InterfaceMethod],
+    ) -> Vec<AnalyzedResource> {
+        types
+            .filter(|(_, id)| matches!(self.resolve.types[*id].kind, TypeDefKind::Resource))
+            .map(|(name, id)| AnalyzedResource {
+                name: name.clone(),
+                go_type_name: GoIdentifier::public(crate::qualified_type_name(id, self.resolve)),
+                table_field: GoIdentifier::private(crate::resource_table_field(
+                    id,
+                    self.resolve,
+                    false,
+                )),
+                methods: methods
+                    .iter()
+                    .filter(|method| method.wit_function.kind == FunctionKind::Method(id))
+                    .cloned()
+                    .collect(),
+            })
+            .collect()
+    }
+
     fn analyze_interface(&self, interface_id: InterfaceId) -> AnalyzedInterface {
         let interface = &self.resolve.interfaces[interface_id];
         let interface_name = interface.name.as_ref().expect("interface missing name");
@@ -147,25 +228,8 @@ impl<'a> ImportAnalyzer<'a> {
             .collect();
 
         // Analyze the resources and attach each resource's methods to it
-        let resources = interface
-            .types
-            .iter()
-            .filter(|(_, id)| matches!(self.resolve.types[**id].kind, TypeDefKind::Resource))
-            .map(|(name, &id)| AnalyzedResource {
-                name: name.clone(),
-                go_type_name: GoIdentifier::public(crate::qualified_type_name(id, self.resolve)),
-                table_field: GoIdentifier::private(crate::resource_table_field(
-                    id,
-                    self.resolve,
-                    false,
-                )),
-                methods: methods
-                    .iter()
-                    .filter(|method| method.wit_function.kind == FunctionKind::Method(id))
-                    .cloned()
-                    .collect(),
-            })
-            .collect();
+        let resources = self
+            .analyze_interface_resources(interface.types.iter().map(|(n, id)| (n, *id)), &methods);
 
         // Generate names
         let go_interface_name =
@@ -222,7 +286,7 @@ impl<'a> ImportAnalyzer<'a> {
 
     pub(super) fn analyze_type(&self, type_id: TypeId) -> Option<AnalyzedType> {
         let type_def = &self.resolve.types[type_id];
-        let qualified = crate::qualified_type_name(type_id, self.resolve);
+        let qualified = self.exported.type_name(type_id, self.resolve);
         let go_type_name = GoIdentifier::public(&qualified);
         // Variants live here (not in `analyze_type_definition`) because
         // their case wrapper names need the qualified variant name.
@@ -247,7 +311,7 @@ impl<'a> ImportAnalyzer<'a> {
     fn analyze_variant_case(&self, variant_name: &str, case: &Case) -> VariantCase {
         let payload = case.ty.as_ref().map(|t| {
             let position = format!("the payload of variant case `{}`", case.name);
-            resolve_nested_type(t, self.resolve, &position)
+            resolve_nested_type_in(t, self.resolve, &self.exported, &position)
         });
         let dispatch = match crate::case_dispatch_kind(case, self.resolve) {
             crate::CaseDispatchKind::DirectRecord => CaseDispatch::DirectRecord {
@@ -276,7 +340,12 @@ impl<'a> ImportAnalyzer<'a> {
                         let position = format!("record field `{}`", field.name);
                         (
                             GoIdentifier::public(&field.name),
-                            resolve_nested_type(&field.ty, self.resolve, &position),
+                            resolve_nested_type_in(
+                                &field.ty,
+                                self.resolve,
+                                &self.exported,
+                                &position,
+                            ),
                         )
                     })
                     .collect(),
@@ -847,6 +916,40 @@ mod tests {
             .expect("world should have resource tables");
         assert_eq!(resources.imported.len(), 1);
         assert!(resources.exported.is_empty());
+    }
+
+    /// A resource declared in the world itself is served from `$root`, with
+    /// the world's own functions, by one more Go interface.
+    #[test]
+    fn test_world_resource() {
+        let fixture = Fixture::parse(
+            "package test:fixture;
+            world test-world {
+                resource thing {
+                    constructor(n: u32);
+                    get: func() -> u32;
+                }
+                import peek: func(t: borrow<thing>) -> u32;
+            }",
+        );
+        let analyzed = ImportAnalyzer::new(&fixture.resolve, fixture.world()).analyze();
+        let generator = ImportCodeGenerator::new(&fixture.resolve, &analyzed, &fixture.sizes);
+        let chains = generator.import_chains();
+        let chain = chains["$root"].to_string().unwrap();
+        let mut tokens = Tokens::<Go>::new();
+        generator.format_into(&mut tokens);
+        let types = tokens.to_string().unwrap();
+        println!("Types:\n{types}\nChain:\n{chain}");
+
+        assert!(types.contains("type ITestWorldWorld interface {"));
+        assert!(types.contains("type Thing interface {"));
+        assert!(chain.contains("NewHostModuleBuilder(\"$root\")"));
+        assert!(chain.contains("world.NewThing(ctx, "));
+        assert!(chain.contains("world.Peek(ctx, "));
+        assert!(chain.contains("Export(\"[constructor]thing\")"));
+        assert!(chain.contains("Export(\"[method]thing.get\")"));
+        assert!(chain.contains("Export(\"peek\")"));
+        assert!(chain.contains("Export(\"[resource-drop]thing\")"));
     }
 
     /// The guest reaches the built-ins for a resource it implements through

@@ -6,6 +6,7 @@ import "context"
 import "errors"
 import "github.com/tetratelabs/wazero"
 import "github.com/tetratelabs/wazero/api"
+import "runtime"
 import "strconv"
 import "sync"
 import "sync/atomic"
@@ -54,6 +55,26 @@ type Counter interface {
 	) string
 }
 
+type IResourcesWorld interface {
+	ReadClock(
+		ctx context.Context,
+		c Clock,
+	) uint32
+	NewClock(
+		ctx context.Context,
+		start uint32,
+	) Clock
+}
+
+// Clock is the `clock` resource, which the host implements.
+// When the guest drops the last handle that owns a value, gravity calls the
+// value's `ResourceDrop(ctx context.Context)` method if it has one.
+type Clock interface {
+	Tick(
+		ctx context.Context,
+	) uint32
+}
+
 type ResourcesFactory struct {
 	runtime wazero.Runtime
 	module wazero.CompiledModule
@@ -65,6 +86,7 @@ type ResourcesFactory struct {
 func NewResourcesFactory(
 	ctx context.Context,
 	host IResourcesHost,
+	world IResourcesWorld,
 ) (*ResourcesFactory, error) {
 	wazeroRuntime := wazero.NewRuntime(ctx)
 
@@ -78,6 +100,75 @@ func NewResourcesFactory(
 		return tables.(*resourcesResourceTables)
 	}
 
+	_, err1 := wazeroRuntime.NewHostModuleBuilder("$root").
+	NewFunctionBuilder().
+	WithFunc(func(
+		ctx context.Context,
+		mod api.Module,
+		arg0 uint32,
+	) uint32{
+		resource0, ok0 := resourcesOf(mod).importedClock.get(uint32(arg0))
+		// The return type doesn't contain an error so we panic if one is encountered
+		if !ok0 {
+			panic(errors.New("invalid clock handle"))
+		}
+		value2 := world.ReadClock(ctx, resource0)
+		result3 := uint32(value2)
+		return result3
+	}).
+	Export("read-clock").
+	NewFunctionBuilder().
+	WithFunc(func(
+		ctx context.Context,
+		mod api.Module,
+		arg0 uint32,
+	) uint32{
+		result0 := uint32(arg0)
+		value1 := world.NewClock(ctx, result0)
+		handle2 := resourcesOf(mod).importedClock.add(value1, true)
+		return handle2
+	}).
+	Export("[constructor]clock").
+	NewFunctionBuilder().
+	WithFunc(func(
+		ctx context.Context,
+		mod api.Module,
+		arg0 uint32,
+	) uint32{
+		resource0, ok0 := resourcesOf(mod).importedClock.get(uint32(arg0))
+		// The return type doesn't contain an error so we panic if one is encountered
+		if !ok0 {
+			panic(errors.New("invalid clock handle"))
+		}
+		value2 := resource0.Tick(ctx, )
+		result3 := uint32(value2)
+		return result3
+	}).
+	Export("[method]clock.tick").
+	NewFunctionBuilder().
+	WithFunc(func(
+		ctx context.Context,
+		mod api.Module,
+		handle uint32,
+	) {
+		value, own, ok := resourcesOf(mod).importedClock.remove(handle)
+		if !ok {
+			panic(errors.New("invalid clock handle"))
+		}
+		// A borrowed handle does not own the value, so dropping it leaves the
+		// value alone.
+		if !own {
+			return
+		}
+		if dropper, ok := any(value).(interface{ ResourceDrop(ctx context.Context) }); ok {
+			dropper.ResourceDrop(ctx)
+		}
+	}).
+	Export("[resource-drop]clock").
+	Instantiate(ctx)
+	if err1 != nil {
+		return nil, err1
+	}
 	_, errExport0 := wazeroRuntime.NewHostModuleBuilder("[export]arcjet:resources/guest").
 	NewFunctionBuilder().
 	WithFunc(func(
@@ -354,6 +445,8 @@ type resourceTable[T any] struct {
 	mu sync.Mutex
 	entries []resourceHandle[T]
 	free []uint32
+	// borrows counts the live handles that do not own their value.
+	borrows int
 }
 
 // add stores value and returns its new handle.
@@ -361,6 +454,9 @@ func (t *resourceTable[T]) add(value T, own bool) uint32 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	entry := resourceHandle[T]{value: value, own: own, live: true}
+	if !own {
+		t.borrows++
+	}
 	if n := len(t.free); n > 0 {
 		handle := t.free[n-1]
 		t.free = t.free[:n-1]
@@ -398,9 +494,32 @@ func (t *resourceTable[T]) remove(handle uint32) (value T, own bool, ok bool) {
 		return value, false, false
 	}
 	value, own = entry.value, entry.own
+	if !own {
+		t.borrows--
+	}
 	*entry = resourceHandle[T]{}
 	t.free = append(t.free, handle)
 	return value, own, true
+}
+
+// dropBorrows removes the borrowed handles that are still in the table and
+// returns how many there were. A borrow ends with the call that lent it, so
+// the guest must have dropped every one by the time the call returns.
+func (t *resourceTable[T]) dropBorrows() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	kept := t.borrows
+	if kept == 0 {
+		return 0
+	}
+	for index := range t.entries {
+		if entry := &t.entries[index]; entry.live && !entry.own {
+			*entry = resourceHandle[T]{}
+			t.free = append(t.free, uint32(index+1))
+		}
+	}
+	t.borrows = 0
+	return kept
 }
 
 // take deletes a handle that owns its value and returns the value. It fails
@@ -423,7 +542,45 @@ func (t *resourceTable[T]) take(handle uint32) (value T, ok bool) {
 // the guest implements.
 type resourcesResourceTables struct {
 	importedCounter resourceTable[Counter]
+	importedClock resourceTable[Clock]
 	exportedAccumulator resourceTable[uint32]
+	// collected lists the guest resources whose Go handles the garbage
+	// collector freed before anyone dropped them.
+	collectedMu sync.Mutex
+	collected []collectedResource
+}
+
+// collectedResource names a guest resource to destroy: the guest's destructor
+// export and the resource's representation.
+type collectedResource struct {
+	dtor string
+	rep uint32
+}
+
+// collect queues a resource for destruction. The garbage collector calls it
+// from its own goroutine when a handle is freed. A module instance is not safe
+// for concurrent use, so the destructor cannot run here: the next call into
+// the instance runs it.
+func (t *resourcesResourceTables) collect(resource collectedResource) {
+	t.collectedMu.Lock()
+	defer t.collectedMu.Unlock()
+	t.collected = append(t.collected, resource)
+}
+
+// dropCollected runs the guest's destructor for every resource whose handle
+// the garbage collector freed since the last call.
+func (i *ResourcesInstance) dropCollected(ctx context.Context) {
+	i.resources.collectedMu.Lock()
+	collected := i.resources.collected
+	i.resources.collected = nil
+	i.resources.collectedMu.Unlock()
+	for _, resource := range collected {
+		if dtor := i.module.ExportedFunction(resource.dtor); dtor != nil {
+			if _, err := dtor.Call(ctx, uint64(resource.rep)); err != nil {
+				panic(err)
+			}
+		}
+	}
 }
 
 // writeString will put a Go string into the Wasm memory following the Component
@@ -450,10 +607,51 @@ func writeString(
 	return uint64(ptr), uint64(len(s)), nil
 }
 
+func (i *ResourcesInstance) Ticks(
+	ctx context.Context,
+	start uint32,
+	n uint32,
+) uint32 {
+	i.dropCollected(ctx)
+	arg0 := start
+	arg1 := n
+	result0 := uint32(arg0)
+	result1 := uint32(arg1)
+	raw2, err2 := i.module.ExportedFunction("ticks").Call(ctx, uint64(result0), uint64(result1))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err2 != nil {
+		panic(err2)
+	}
+
+	results2 := raw2[0]
+	result3 := uint32(results2)
+	return result3
+}
+
+func (i *ResourcesInstance) Forget(
+	ctx context.Context,
+	c Counter,
+) {
+	i.dropCollected(ctx)
+	arg0 := c
+	handle0 := i.resources.importedCounter.add(arg0, false)
+	_, err1 := i.module.ExportedFunction("forget").Call(ctx, uint64(handle0))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err1 != nil {
+		panic(err1)
+	}
+
+	// The return type doesn't contain an error so we panic if one is encountered
+	if i.resources.importedCounter.dropBorrows() != 0 {
+		panic(errors.New("guest kept a borrowed counter handle after the call returned"))
+	}
+}
+
 func (i *ResourcesInstance) Bump(
 	ctx context.Context,
 	c Counter,
 ) uint32 {
+	i.dropCollected(ctx)
 	arg0 := c
 	handle0 := i.resources.importedCounter.add(arg0, false)
 	raw1, err1 := i.module.ExportedFunction("bump").Call(ctx, uint64(handle0))
@@ -463,14 +661,19 @@ func (i *ResourcesInstance) Bump(
 	}
 
 	results1 := raw1[0]
-	result2 := uint32(results1)
-	return result2
+	// The return type doesn't contain an error so we panic if one is encountered
+	if i.resources.importedCounter.dropBorrows() != 0 {
+		panic(errors.New("guest kept a borrowed counter handle after the call returned"))
+	}
+	result3 := uint32(results1)
+	return result3
 }
 
 func (i *ResourcesInstance) Take(
 	ctx context.Context,
 	c Counter,
 ) uint32 {
+	i.dropCollected(ctx)
 	arg0 := c
 	handle0 := i.resources.importedCounter.add(arg0, true)
 	raw1, err1 := i.module.ExportedFunction("take").Call(ctx, uint64(handle0))
@@ -488,6 +691,7 @@ func (i *ResourcesInstance) Roundtrip(
 	ctx context.Context,
 	c Counter,
 ) Counter {
+	i.dropCollected(ctx)
 	arg0 := c
 	handle0 := i.resources.importedCounter.add(arg0, true)
 	raw1, err1 := i.module.ExportedFunction("roundtrip").Call(ctx, uint64(handle0))
@@ -523,6 +727,7 @@ func (i *ResourcesInstance) Fresh(
 	ctx context.Context,
 	start uint32,
 ) Counter {
+	i.dropCollected(ctx)
 	arg0 := start
 	result0 := uint32(arg0)
 	raw1, err1 := i.module.ExportedFunction("fresh").Call(ctx, uint64(result0))
@@ -558,6 +763,7 @@ func (i *ResourcesInstance) Exercise(
 	ctx context.Context,
 	start uint32,
 ) string {
+	i.dropCollected(ctx)
 	arg0 := start
 	result0 := uint32(arg0)
 	raw1, err1 := i.module.ExportedFunction("exercise").Call(ctx, uint64(result0))
@@ -605,6 +811,7 @@ func (i *ResourcesInstance) Maybe(
 	start uint32,
 	some bool,
 ) *Counter {
+	i.dropCollected(ctx)
 	arg0 := start
 	arg1 := some
 	result0 := uint32(arg0)
@@ -662,6 +869,7 @@ func (i *ResourcesInstance) Batch(
 	ctx context.Context,
 	n uint32,
 ) []Counter {
+	i.dropCollected(ctx)
 	arg0 := n
 	result0 := uint32(arg0)
 	raw1, err1 := i.module.ExportedFunction("batch").Call(ctx, uint64(result0))
@@ -715,13 +923,45 @@ func (i *ResourcesInstance) Batch(
 	return result7
 }
 
+type Tagged struct {
+	Tag string
+	Acc *Accumulator
+}
+
+type Holder interface {
+	isHolder()
+}
+
+type HolderEmpty struct {}
+
+func (HolderEmpty) isHolder() {}
+
+type HolderFull struct {
+	Value *Accumulator
+}
+
+func (HolderFull) isHolder() {}
+
 // Accumulator owns a `accumulator` resource, which the guest implements.
-// Call Drop when the value is no longer needed, or the guest keeps it until the
-// instance is closed. A handle belongs to the instance that returned it.
+// Call Drop when the value is no longer needed. A handle that is garbage
+// collected without a Drop is destroyed by a later call into its instance,
+// which can be much later. A handle belongs to the instance that returned it.
 type Accumulator struct {
 	instance *ResourcesInstance
 	rep uint32
 	dropped bool
+	// cleanup queues the resource for destruction when the handle is collected.
+	cleanup runtime.Cleanup
+}
+
+// adoptAccumulator wraps a representation the guest handed over in a handle that owns it.
+func adoptAccumulator(i *ResourcesInstance, rep uint32) *Accumulator {
+	handle := &Accumulator{instance: i, rep: rep}
+	handle.cleanup = runtime.AddCleanup(handle, i.resources.collect, collectedResource{
+		dtor: "arcjet:resources/guest#[dtor]accumulator",
+		rep: rep,
+	})
+	return handle
 }
 
 // Drop runs the guest's destructor for the resource. The handle must not be
@@ -731,6 +971,7 @@ func (self *Accumulator) Drop(ctx context.Context) error {
 		return nil
 	}
 	self.dropped = true
+	self.cleanup.Stop()
 	if dtor := self.instance.module.ExportedFunction("arcjet:resources/guest#[dtor]accumulator"); dtor != nil {
 		if _, err := dtor.Call(ctx, uint64(self.rep)); err != nil {
 			return err
@@ -755,6 +996,7 @@ func (self *Accumulator) lend(i *ResourcesInstance) uint32 {
 func (self *Accumulator) give(i *ResourcesInstance) uint32 {
 	rep := self.lend(i)
 	self.dropped = true
+	self.cleanup.Stop()
 	return rep
 }
 
@@ -762,6 +1004,7 @@ func (i *ResourcesInstance) NewAccumulator(
 	ctx context.Context,
 	label string,
 ) *Accumulator {
+	i.dropCollected(ctx)
 	arg0 := label
 	memory0 := i.module.Memory()
 	realloc0 := i.module.ExportedFunction("cabi_realloc")
@@ -796,7 +1039,7 @@ func (i *ResourcesInstance) NewAccumulator(
 	if !ok2 {
 		panic(errors.New("invalid accumulator handle"))
 	}
-	wrapped2 := &Accumulator{instance: i, rep: resource2}
+	wrapped2 := adoptAccumulator(i, resource2)
 	return wrapped2
 }
 
@@ -805,6 +1048,7 @@ func (self *Accumulator) Add(
 	n uint32,
 ) {
 	i := self.instance
+	i.dropCollected(ctx)
 	arg0 := self
 	arg1 := n
 	handle0 := arg0.lend(i)
@@ -820,6 +1064,7 @@ func (self *Accumulator) Total(
 	ctx context.Context,
 ) uint32 {
 	i := self.instance
+	i.dropCollected(ctx)
 	arg0 := self
 	handle0 := arg0.lend(i)
 	raw1, err1 := i.module.ExportedFunction("arcjet:resources/guest#[method]accumulator.total").Call(ctx, uint64(handle0))
@@ -837,6 +1082,7 @@ func (self *Accumulator) Label(
 	ctx context.Context,
 ) string {
 	i := self.instance
+	i.dropCollected(ctx)
 	arg0 := self
 	handle0 := arg0.lend(i)
 	raw1, err1 := i.module.ExportedFunction("arcjet:resources/guest#[method]accumulator.label").Call(ctx, uint64(handle0))
@@ -884,6 +1130,7 @@ func (i *ResourcesInstance) AccumulatorCombine(
 	a *Accumulator,
 	b *Accumulator,
 ) *Accumulator {
+	i.dropCollected(ctx)
 	arg0 := a
 	arg1 := b
 	handle0 := i.resources.exportedAccumulator.add(arg0.give(i), true)
@@ -914,14 +1161,203 @@ func (i *ResourcesInstance) AccumulatorCombine(
 	if !ok3 {
 		panic(errors.New("invalid accumulator handle"))
 	}
-	wrapped3 := &Accumulator{instance: i, rep: resource3}
+	wrapped3 := adoptAccumulator(i, resource3)
 	return wrapped3
+}
+
+func (i *ResourcesInstance) Wrap(
+	ctx context.Context,
+	tag string,
+	n uint32,
+) Tagged {
+	i.dropCollected(ctx)
+	arg0 := tag
+	arg1 := n
+	memory0 := i.module.Memory()
+	realloc0 := i.module.ExportedFunction("cabi_realloc")
+	ptr0, len0, err0 := writeString(ctx, arg0, memory0, realloc0)
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err0 != nil {
+		panic(err0)
+	}
+	result1 := uint32(arg1)
+	raw2, err2 := i.module.ExportedFunction("arcjet:resources/guest#wrap").Call(ctx, uint64(ptr0), uint64(len0), uint64(result1))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err2 != nil {
+		panic(err2)
+	}
+
+	// The cleanup via `cabi_post_*` cleans up the memory in the guest. By
+	// deferring this, we ensure that no memory is corrupted before the function
+	// is done accessing it.
+	defer func() {
+		if postFn := i.module.ExportedFunction("cabi_post_arcjet:resources/guest#wrap"); postFn != nil {
+			if _, err := postFn.Call(ctx, raw2...); err != nil {
+				// If we get an error during cleanup, something really bad is
+				// going on, so we panic. Also, you can't return the error from
+				// the `defer`
+				panic(errors.New("failed to cleanup"))
+			}
+		}
+	}()
+
+	results2 := raw2[0]
+	ptr3, ok3 := i.module.Memory().ReadUint32Le(uint32(results2 + 0))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if !ok3 {
+		panic(errors.New("failed to read pointer from memory"))
+	}
+	len4, ok4 := i.module.Memory().ReadUint32Le(uint32(results2 + 4))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if !ok4 {
+		panic(errors.New("failed to read length from memory"))
+	}
+	buf5, ok5 := i.module.Memory().Read(ptr3, len4)
+	// The return type doesn't contain an error so we panic if one is encountered
+	if !ok5 {
+		panic(errors.New("failed to read bytes from memory"))
+	}
+	str5 := string(buf5)
+	value6, ok6 := i.module.Memory().ReadUint32Le(uint32(results2 + 8))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if !ok6 {
+		panic(errors.New("failed to read i32 from memory"))
+	}
+	resource7, ok7 := i.resources.exportedAccumulator.take(uint32(value6))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if !ok7 {
+		panic(errors.New("invalid accumulator handle"))
+	}
+	wrapped7 := adoptAccumulator(i, resource7)
+	value9 := Tagged{
+		Tag: str5,
+		Acc: wrapped7,
+	}
+	return value9
+}
+
+func (i *ResourcesInstance) Unwrap(
+	ctx context.Context,
+	t Tagged,
+) uint32 {
+	i.dropCollected(ctx)
+	arg0 := t
+	tag0 := arg0.Tag
+	acc0 := arg0.Acc
+	memory1 := i.module.Memory()
+	realloc1 := i.module.ExportedFunction("cabi_realloc")
+	ptr1, len1, err1 := writeString(ctx, tag0, memory1, realloc1)
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err1 != nil {
+		panic(err1)
+	}
+	handle2 := i.resources.exportedAccumulator.add(acc0.give(i), true)
+	raw3, err3 := i.module.ExportedFunction("arcjet:resources/guest#unwrap").Call(ctx, uint64(ptr1), uint64(len1), uint64(handle2))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err3 != nil {
+		panic(err3)
+	}
+
+	results3 := raw3[0]
+	result4 := uint32(results3)
+	return result4
+}
+
+func (i *ResourcesInstance) Hold(
+	ctx context.Context,
+	n uint32,
+) Holder {
+	i.dropCollected(ctx)
+	arg0 := n
+	result0 := uint32(arg0)
+	raw1, err1 := i.module.ExportedFunction("arcjet:resources/guest#hold").Call(ctx, uint64(result0))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err1 != nil {
+		panic(err1)
+	}
+
+	// The cleanup via `cabi_post_*` cleans up the memory in the guest. By
+	// deferring this, we ensure that no memory is corrupted before the function
+	// is done accessing it.
+	defer func() {
+		if postFn := i.module.ExportedFunction("cabi_post_arcjet:resources/guest#hold"); postFn != nil {
+			if _, err := postFn.Call(ctx, raw1...); err != nil {
+				// If we get an error during cleanup, something really bad is
+				// going on, so we panic. Also, you can't return the error from
+				// the `defer`
+				panic(errors.New("failed to cleanup"))
+			}
+		}
+	}()
+
+	results1 := raw1[0]
+	value2, ok2 := i.module.Memory().ReadByte(uint32(results1 + 0))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if !ok2 {
+		panic(errors.New("failed to read byte from memory"))
+	}
+	var value6 Holder
+	switch value2 {
+	case 0:
+		value6 = HolderEmpty{}
+	case 1:
+		value3, ok3 := i.module.Memory().ReadUint32Le(uint32(results1 + 4))
+		// The return type doesn't contain an error so we panic if one is encountered
+		if !ok3 {
+			panic(errors.New("failed to read i32 from memory"))
+		}
+		resource4, ok4 := i.resources.exportedAccumulator.take(uint32(value3))
+		// The return type doesn't contain an error so we panic if one is encountered
+		if !ok4 {
+			panic(errors.New("invalid accumulator handle"))
+		}
+		wrapped4 := adoptAccumulator(i, resource4)
+		value6 = HolderFull{Value: wrapped4}
+	default:
+		// The return type doesn't contain an error so we panic if one is encountered
+		panic(errors.New("invalid holder discriminant"))
+	}
+	return value6
+}
+
+func (i *ResourcesInstance) Weigh(
+	ctx context.Context,
+	h interface{},
+) uint32 {
+	i.dropCollected(ctx)
+	arg0 := h
+	var variant1_0 uint32
+	var variant1_1 uint32
+	switch case1 := arg0.(type) {
+		case HolderEmpty:
+			_ = case1
+			variant1_0 = 0
+			variant1_1 = 0
+		case HolderFull:
+			variantPayload := case1.Value
+			handle0 := i.resources.exportedAccumulator.add(variantPayload.give(i), true)
+			variant1_0 = 1
+			variant1_1 = handle0
+		default:
+			// The return type doesn't contain an error so we panic if one is encountered
+			panic(errors.New("invalid variant type provided"))
+	}
+	raw2, err2 := i.module.ExportedFunction("arcjet:resources/guest#weigh").Call(ctx, uint64(variant1_0), uint64(variant1_1))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err2 != nil {
+		panic(err2)
+	}
+
+	results2 := raw2[0]
+	result3 := uint32(results2)
+	return result3
 }
 
 func (i *ResourcesInstance) Sum(
 	ctx context.Context,
 	a *Accumulator,
 ) uint32 {
+	i.dropCollected(ctx)
 	arg0 := a
 	handle0 := arg0.lend(i)
 	raw1, err1 := i.module.ExportedFunction("arcjet:resources/guest#sum").Call(ctx, uint64(handle0))
@@ -939,6 +1375,7 @@ func (i *ResourcesInstance) Finish(
 	ctx context.Context,
 	a *Accumulator,
 ) uint32 {
+	i.dropCollected(ctx)
 	arg0 := a
 	handle0 := i.resources.exportedAccumulator.add(arg0.give(i), true)
 	raw1, err1 := i.module.ExportedFunction("arcjet:resources/guest#finish").Call(ctx, uint64(handle0))
@@ -957,6 +1394,7 @@ func (i *ResourcesInstance) Make(
 	label string,
 	n uint32,
 ) *Accumulator {
+	i.dropCollected(ctx)
 	arg0 := label
 	arg1 := n
 	memory0 := i.module.Memory()
@@ -993,7 +1431,7 @@ func (i *ResourcesInstance) Make(
 	if !ok3 {
 		panic(errors.New("invalid accumulator handle"))
 	}
-	wrapped3 := &Accumulator{instance: i, rep: resource3}
+	wrapped3 := adoptAccumulator(i, resource3)
 	return wrapped3
 }
 
@@ -1001,6 +1439,7 @@ func (i *ResourcesInstance) TryMake(
 	ctx context.Context,
 	label string,
 ) (*Accumulator, error) {
+	i.dropCollected(ctx)
 	arg0 := label
 	memory0 := i.module.Memory()
 	realloc0 := i.module.ExportedFunction("cabi_realloc")
@@ -1049,7 +1488,7 @@ func (i *ResourcesInstance) TryMake(
 			var default5 *Accumulator
 			return default5, errors.New("invalid accumulator handle")
 		}
-		wrapped4 := &Accumulator{instance: i, rep: resource4}
+		wrapped4 := adoptAccumulator(i, resource4)
 		value9 = wrapped4
 	case 1:
 		ptr6, ok6 := i.module.Memory().ReadUint32Le(uint32(results1 + 4))
@@ -1078,6 +1517,7 @@ func (i *ResourcesInstance) TryMake(
 func (i *ResourcesInstance) Live(
 	ctx context.Context,
 ) uint32 {
+	i.dropCollected(ctx)
 	raw0, err0 := i.module.ExportedFunction("arcjet:resources/guest#live").Call(ctx, )
 	// The return type doesn't contain an error so we panic if one is encountered
 	if err0 != nil {

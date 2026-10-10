@@ -6,6 +6,7 @@ import "context"
 import "errors"
 import "github.com/tetratelabs/wazero"
 import "github.com/tetratelabs/wazero/api"
+import "runtime"
 import "strconv"
 import "sync"
 import "sync/atomic"
@@ -24,6 +25,11 @@ type IResourcesSharedTypesA interface {
 		ctx context.Context,
 		value string,
 	) Bar
+	LabelFoo(
+		ctx context.Context,
+		label string,
+		x uint32,
+	) Labeled
 	DoubleFooX(
 		ctx context.Context,
 		f TypesAFoo,
@@ -58,6 +64,11 @@ type Bar interface {
 		ctx context.Context,
 		s string,
 	)
+}
+
+type Labeled struct {
+	Label string
+	Foo TypesAFoo
 }
 
 type IResourcesSharedTypesB interface {
@@ -406,6 +417,36 @@ func NewResourcesSharedFactory(
 		ctx context.Context,
 		mod api.Module,
 		arg0 uint32,
+		arg1 uint32,
+		arg2 uint32,
+		arg3 uint32,
+	) {
+		buf0, ok0 := mod.Memory().Read(arg0, arg1)
+		if !ok0 {
+			panic(errors.New("failed to read bytes from memory"))
+		}
+		str0 := string(buf0)
+		result1 := uint32(arg2)
+		value2 := typesA.LabelFoo(ctx, str0, result1)
+		label3 := value2.Label
+		foo3 := value2.Foo
+		memory4 := mod.Memory()
+		realloc4 := mod.ExportedFunction("cabi_realloc")
+		ptr4, len4, err4 := writeString(ctx, label3, memory4, realloc4)
+		if err4 != nil {
+			panic(err4)
+		}
+		mod.Memory().WriteUint32Le(arg3+4, uint32(len4))
+		mod.Memory().WriteUint32Le(arg3+0, uint32(ptr4))
+		handle5 := resourcesOf(mod).importedTypesAFoo.add(foo3, true)
+		mod.Memory().WriteUint32Le(arg3+8, uint32(handle5))
+	}).
+	Export("label-foo").
+	NewFunctionBuilder().
+	WithFunc(func(
+		ctx context.Context,
+		mod api.Module,
+		arg0 uint32,
 	) uint32{
 		resource0, ok0 := resourcesOf(mod).importedTypesAFoo.get(uint32(arg0))
 		// The return type doesn't contain an error so we panic if one is encountered
@@ -728,6 +769,8 @@ type resourceTable[T any] struct {
 	mu sync.Mutex
 	entries []resourceHandle[T]
 	free []uint32
+	// borrows counts the live handles that do not own their value.
+	borrows int
 }
 
 // add stores value and returns its new handle.
@@ -735,6 +778,9 @@ func (t *resourceTable[T]) add(value T, own bool) uint32 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	entry := resourceHandle[T]{value: value, own: own, live: true}
+	if !own {
+		t.borrows++
+	}
 	if n := len(t.free); n > 0 {
 		handle := t.free[n-1]
 		t.free = t.free[:n-1]
@@ -772,9 +818,32 @@ func (t *resourceTable[T]) remove(handle uint32) (value T, own bool, ok bool) {
 		return value, false, false
 	}
 	value, own = entry.value, entry.own
+	if !own {
+		t.borrows--
+	}
 	*entry = resourceHandle[T]{}
 	t.free = append(t.free, handle)
 	return value, own, true
+}
+
+// dropBorrows removes the borrowed handles that are still in the table and
+// returns how many there were. A borrow ends with the call that lent it, so
+// the guest must have dropped every one by the time the call returns.
+func (t *resourceTable[T]) dropBorrows() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	kept := t.borrows
+	if kept == 0 {
+		return 0
+	}
+	for index := range t.entries {
+		if entry := &t.entries[index]; entry.live && !entry.own {
+			*entry = resourceHandle[T]{}
+			t.free = append(t.free, uint32(index+1))
+		}
+	}
+	t.borrows = 0
+	return kept
 }
 
 // take deletes a handle that owns its value and returns the value. It fails
@@ -804,6 +873,43 @@ type resourcesSharedResourceTables struct {
 	exportedBar resourceTable[uint32]
 	exportedTypesBFoo resourceTable[uint32]
 	exportedBaz resourceTable[uint32]
+	// collected lists the guest resources whose Go handles the garbage
+	// collector freed before anyone dropped them.
+	collectedMu sync.Mutex
+	collected []collectedResource
+}
+
+// collectedResource names a guest resource to destroy: the guest's destructor
+// export and the resource's representation.
+type collectedResource struct {
+	dtor string
+	rep uint32
+}
+
+// collect queues a resource for destruction. The garbage collector calls it
+// from its own goroutine when a handle is freed. A module instance is not safe
+// for concurrent use, so the destructor cannot run here: the next call into
+// the instance runs it.
+func (t *resourcesSharedResourceTables) collect(resource collectedResource) {
+	t.collectedMu.Lock()
+	defer t.collectedMu.Unlock()
+	t.collected = append(t.collected, resource)
+}
+
+// dropCollected runs the guest's destructor for every resource whose handle
+// the garbage collector freed since the last call.
+func (i *ResourcesSharedInstance) dropCollected(ctx context.Context) {
+	i.resources.collectedMu.Lock()
+	collected := i.resources.collected
+	i.resources.collected = nil
+	i.resources.collectedMu.Unlock()
+	for _, resource := range collected {
+		if dtor := i.module.ExportedFunction(resource.dtor); dtor != nil {
+			if _, err := dtor.Call(ctx, uint64(resource.rep)); err != nil {
+				panic(err)
+			}
+		}
+	}
 }
 
 // writeString will put a Go string into the Wasm memory following the Component
@@ -835,6 +941,7 @@ func (i *ResourcesSharedInstance) UseHost(
 	x uint32,
 	y string,
 ) string {
+	i.dropCollected(ctx)
 	arg0 := x
 	arg1 := y
 	result0 := uint32(arg0)
@@ -885,13 +992,31 @@ func (i *ResourcesSharedInstance) UseHost(
 	return str5
 }
 
+type ExportedLabeled struct {
+	Label string
+	Foo *ExportedTypesAFoo
+}
+
 // ExportedTypesAFoo owns a `foo` resource, which the guest implements.
-// Call Drop when the value is no longer needed, or the guest keeps it until the
-// instance is closed. A handle belongs to the instance that returned it.
+// Call Drop when the value is no longer needed. A handle that is garbage
+// collected without a Drop is destroyed by a later call into its instance,
+// which can be much later. A handle belongs to the instance that returned it.
 type ExportedTypesAFoo struct {
 	instance *ResourcesSharedInstance
 	rep uint32
 	dropped bool
+	// cleanup queues the resource for destruction when the handle is collected.
+	cleanup runtime.Cleanup
+}
+
+// adoptExportedTypesAFoo wraps a representation the guest handed over in a handle that owns it.
+func adoptExportedTypesAFoo(i *ResourcesSharedInstance, rep uint32) *ExportedTypesAFoo {
+	handle := &ExportedTypesAFoo{instance: i, rep: rep}
+	handle.cleanup = runtime.AddCleanup(handle, i.resources.collect, collectedResource{
+		dtor: "arcjet:resources-shared/types-a#[dtor]foo",
+		rep: rep,
+	})
+	return handle
 }
 
 // Drop runs the guest's destructor for the resource. The handle must not be
@@ -901,6 +1026,7 @@ func (self *ExportedTypesAFoo) Drop(ctx context.Context) error {
 		return nil
 	}
 	self.dropped = true
+	self.cleanup.Stop()
 	if dtor := self.instance.module.ExportedFunction("arcjet:resources-shared/types-a#[dtor]foo"); dtor != nil {
 		if _, err := dtor.Call(ctx, uint64(self.rep)); err != nil {
 			return err
@@ -925,16 +1051,30 @@ func (self *ExportedTypesAFoo) lend(i *ResourcesSharedInstance) uint32 {
 func (self *ExportedTypesAFoo) give(i *ResourcesSharedInstance) uint32 {
 	rep := self.lend(i)
 	self.dropped = true
+	self.cleanup.Stop()
 	return rep
 }
 
 // ExportedBar owns a `bar` resource, which the guest implements.
-// Call Drop when the value is no longer needed, or the guest keeps it until the
-// instance is closed. A handle belongs to the instance that returned it.
+// Call Drop when the value is no longer needed. A handle that is garbage
+// collected without a Drop is destroyed by a later call into its instance,
+// which can be much later. A handle belongs to the instance that returned it.
 type ExportedBar struct {
 	instance *ResourcesSharedInstance
 	rep uint32
 	dropped bool
+	// cleanup queues the resource for destruction when the handle is collected.
+	cleanup runtime.Cleanup
+}
+
+// adoptExportedBar wraps a representation the guest handed over in a handle that owns it.
+func adoptExportedBar(i *ResourcesSharedInstance, rep uint32) *ExportedBar {
+	handle := &ExportedBar{instance: i, rep: rep}
+	handle.cleanup = runtime.AddCleanup(handle, i.resources.collect, collectedResource{
+		dtor: "arcjet:resources-shared/types-a#[dtor]bar",
+		rep: rep,
+	})
+	return handle
 }
 
 // Drop runs the guest's destructor for the resource. The handle must not be
@@ -944,6 +1084,7 @@ func (self *ExportedBar) Drop(ctx context.Context) error {
 		return nil
 	}
 	self.dropped = true
+	self.cleanup.Stop()
 	if dtor := self.instance.module.ExportedFunction("arcjet:resources-shared/types-a#[dtor]bar"); dtor != nil {
 		if _, err := dtor.Call(ctx, uint64(self.rep)); err != nil {
 			return err
@@ -968,6 +1109,7 @@ func (self *ExportedBar) lend(i *ResourcesSharedInstance) uint32 {
 func (self *ExportedBar) give(i *ResourcesSharedInstance) uint32 {
 	rep := self.lend(i)
 	self.dropped = true
+	self.cleanup.Stop()
 	return rep
 }
 
@@ -975,6 +1117,7 @@ func (i *ResourcesSharedInstance) NewExportedTypesAFoo(
 	ctx context.Context,
 	x uint32,
 ) *ExportedTypesAFoo {
+	i.dropCollected(ctx)
 	arg0 := x
 	result0 := uint32(arg0)
 	raw1, err1 := i.module.ExportedFunction("arcjet:resources-shared/types-a#[constructor]foo").Call(ctx, uint64(result0))
@@ -1003,7 +1146,7 @@ func (i *ResourcesSharedInstance) NewExportedTypesAFoo(
 	if !ok2 {
 		panic(errors.New("invalid foo handle"))
 	}
-	wrapped2 := &ExportedTypesAFoo{instance: i, rep: resource2}
+	wrapped2 := adoptExportedTypesAFoo(i, resource2)
 	return wrapped2
 }
 
@@ -1011,6 +1154,7 @@ func (self *ExportedTypesAFoo) GetX(
 	ctx context.Context,
 ) uint32 {
 	i := self.instance
+	i.dropCollected(ctx)
 	arg0 := self
 	handle0 := arg0.lend(i)
 	raw1, err1 := i.module.ExportedFunction("arcjet:resources-shared/types-a#[method]foo.get-x").Call(ctx, uint64(handle0))
@@ -1029,6 +1173,7 @@ func (self *ExportedTypesAFoo) SetX(
 	n uint32,
 ) {
 	i := self.instance
+	i.dropCollected(ctx)
 	arg0 := self
 	arg1 := n
 	handle0 := arg0.lend(i)
@@ -1044,6 +1189,7 @@ func (i *ResourcesSharedInstance) NewExportedBar(
 	ctx context.Context,
 	value string,
 ) *ExportedBar {
+	i.dropCollected(ctx)
 	arg0 := value
 	memory0 := i.module.Memory()
 	realloc0 := i.module.ExportedFunction("cabi_realloc")
@@ -1078,7 +1224,7 @@ func (i *ResourcesSharedInstance) NewExportedBar(
 	if !ok2 {
 		panic(errors.New("invalid bar handle"))
 	}
-	wrapped2 := &ExportedBar{instance: i, rep: resource2}
+	wrapped2 := adoptExportedBar(i, resource2)
 	return wrapped2
 }
 
@@ -1086,6 +1232,7 @@ func (self *ExportedBar) GetValue(
 	ctx context.Context,
 ) string {
 	i := self.instance
+	i.dropCollected(ctx)
 	arg0 := self
 	handle0 := arg0.lend(i)
 	raw1, err1 := i.module.ExportedFunction("arcjet:resources-shared/types-a#[method]bar.get-value").Call(ctx, uint64(handle0))
@@ -1133,6 +1280,7 @@ func (self *ExportedBar) Append(
 	s string,
 ) {
 	i := self.instance
+	i.dropCollected(ctx)
 	arg0 := self
 	arg1 := s
 	handle0 := arg0.lend(i)
@@ -1150,10 +1298,82 @@ func (self *ExportedBar) Append(
 	}
 }
 
+func (i *ResourcesSharedInstance) LabelFoo(
+	ctx context.Context,
+	label string,
+	x uint32,
+) ExportedLabeled {
+	i.dropCollected(ctx)
+	arg0 := label
+	arg1 := x
+	memory0 := i.module.Memory()
+	realloc0 := i.module.ExportedFunction("cabi_realloc")
+	ptr0, len0, err0 := writeString(ctx, arg0, memory0, realloc0)
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err0 != nil {
+		panic(err0)
+	}
+	result1 := uint32(arg1)
+	raw2, err2 := i.module.ExportedFunction("arcjet:resources-shared/types-a#label-foo").Call(ctx, uint64(ptr0), uint64(len0), uint64(result1))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err2 != nil {
+		panic(err2)
+	}
+
+	// The cleanup via `cabi_post_*` cleans up the memory in the guest. By
+	// deferring this, we ensure that no memory is corrupted before the function
+	// is done accessing it.
+	defer func() {
+		if postFn := i.module.ExportedFunction("cabi_post_arcjet:resources-shared/types-a#label-foo"); postFn != nil {
+			if _, err := postFn.Call(ctx, raw2...); err != nil {
+				// If we get an error during cleanup, something really bad is
+				// going on, so we panic. Also, you can't return the error from
+				// the `defer`
+				panic(errors.New("failed to cleanup"))
+			}
+		}
+	}()
+
+	results2 := raw2[0]
+	ptr3, ok3 := i.module.Memory().ReadUint32Le(uint32(results2 + 0))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if !ok3 {
+		panic(errors.New("failed to read pointer from memory"))
+	}
+	len4, ok4 := i.module.Memory().ReadUint32Le(uint32(results2 + 4))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if !ok4 {
+		panic(errors.New("failed to read length from memory"))
+	}
+	buf5, ok5 := i.module.Memory().Read(ptr3, len4)
+	// The return type doesn't contain an error so we panic if one is encountered
+	if !ok5 {
+		panic(errors.New("failed to read bytes from memory"))
+	}
+	str5 := string(buf5)
+	value6, ok6 := i.module.Memory().ReadUint32Le(uint32(results2 + 8))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if !ok6 {
+		panic(errors.New("failed to read i32 from memory"))
+	}
+	resource7, ok7 := i.resources.exportedTypesAFoo.take(uint32(value6))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if !ok7 {
+		panic(errors.New("invalid foo handle"))
+	}
+	wrapped7 := adoptExportedTypesAFoo(i, resource7)
+	value9 := ExportedLabeled{
+		Label: str5,
+		Foo: wrapped7,
+	}
+	return value9
+}
+
 func (i *ResourcesSharedInstance) DoubleFooX(
 	ctx context.Context,
 	f *ExportedTypesAFoo,
 ) uint32 {
+	i.dropCollected(ctx)
 	arg0 := f
 	handle0 := arg0.lend(i)
 	raw1, err1 := i.module.ExportedFunction("arcjet:resources-shared/types-a#double-foo-x").Call(ctx, uint64(handle0))
@@ -1171,6 +1391,7 @@ func (i *ResourcesSharedInstance) MakeBar(
 	ctx context.Context,
 	value string,
 ) *ExportedBar {
+	i.dropCollected(ctx)
 	arg0 := value
 	memory0 := i.module.Memory()
 	realloc0 := i.module.ExportedFunction("cabi_realloc")
@@ -1205,17 +1426,30 @@ func (i *ResourcesSharedInstance) MakeBar(
 	if !ok2 {
 		panic(errors.New("invalid bar handle"))
 	}
-	wrapped2 := &ExportedBar{instance: i, rep: resource2}
+	wrapped2 := adoptExportedBar(i, resource2)
 	return wrapped2
 }
 
 // ExportedTypesBFoo owns a `foo` resource, which the guest implements.
-// Call Drop when the value is no longer needed, or the guest keeps it until the
-// instance is closed. A handle belongs to the instance that returned it.
+// Call Drop when the value is no longer needed. A handle that is garbage
+// collected without a Drop is destroyed by a later call into its instance,
+// which can be much later. A handle belongs to the instance that returned it.
 type ExportedTypesBFoo struct {
 	instance *ResourcesSharedInstance
 	rep uint32
 	dropped bool
+	// cleanup queues the resource for destruction when the handle is collected.
+	cleanup runtime.Cleanup
+}
+
+// adoptExportedTypesBFoo wraps a representation the guest handed over in a handle that owns it.
+func adoptExportedTypesBFoo(i *ResourcesSharedInstance, rep uint32) *ExportedTypesBFoo {
+	handle := &ExportedTypesBFoo{instance: i, rep: rep}
+	handle.cleanup = runtime.AddCleanup(handle, i.resources.collect, collectedResource{
+		dtor: "arcjet:resources-shared/types-b#[dtor]foo",
+		rep: rep,
+	})
+	return handle
 }
 
 // Drop runs the guest's destructor for the resource. The handle must not be
@@ -1225,6 +1459,7 @@ func (self *ExportedTypesBFoo) Drop(ctx context.Context) error {
 		return nil
 	}
 	self.dropped = true
+	self.cleanup.Stop()
 	if dtor := self.instance.module.ExportedFunction("arcjet:resources-shared/types-b#[dtor]foo"); dtor != nil {
 		if _, err := dtor.Call(ctx, uint64(self.rep)); err != nil {
 			return err
@@ -1249,16 +1484,30 @@ func (self *ExportedTypesBFoo) lend(i *ResourcesSharedInstance) uint32 {
 func (self *ExportedTypesBFoo) give(i *ResourcesSharedInstance) uint32 {
 	rep := self.lend(i)
 	self.dropped = true
+	self.cleanup.Stop()
 	return rep
 }
 
 // ExportedBaz owns a `baz` resource, which the guest implements.
-// Call Drop when the value is no longer needed, or the guest keeps it until the
-// instance is closed. A handle belongs to the instance that returned it.
+// Call Drop when the value is no longer needed. A handle that is garbage
+// collected without a Drop is destroyed by a later call into its instance,
+// which can be much later. A handle belongs to the instance that returned it.
 type ExportedBaz struct {
 	instance *ResourcesSharedInstance
 	rep uint32
 	dropped bool
+	// cleanup queues the resource for destruction when the handle is collected.
+	cleanup runtime.Cleanup
+}
+
+// adoptExportedBaz wraps a representation the guest handed over in a handle that owns it.
+func adoptExportedBaz(i *ResourcesSharedInstance, rep uint32) *ExportedBaz {
+	handle := &ExportedBaz{instance: i, rep: rep}
+	handle.cleanup = runtime.AddCleanup(handle, i.resources.collect, collectedResource{
+		dtor: "arcjet:resources-shared/types-b#[dtor]baz",
+		rep: rep,
+	})
+	return handle
 }
 
 // Drop runs the guest's destructor for the resource. The handle must not be
@@ -1268,6 +1517,7 @@ func (self *ExportedBaz) Drop(ctx context.Context) error {
 		return nil
 	}
 	self.dropped = true
+	self.cleanup.Stop()
 	if dtor := self.instance.module.ExportedFunction("arcjet:resources-shared/types-b#[dtor]baz"); dtor != nil {
 		if _, err := dtor.Call(ctx, uint64(self.rep)); err != nil {
 			return err
@@ -1292,6 +1542,7 @@ func (self *ExportedBaz) lend(i *ResourcesSharedInstance) uint32 {
 func (self *ExportedBaz) give(i *ResourcesSharedInstance) uint32 {
 	rep := self.lend(i)
 	self.dropped = true
+	self.cleanup.Stop()
 	return rep
 }
 
@@ -1299,6 +1550,7 @@ func (i *ResourcesSharedInstance) NewExportedTypesBFoo(
 	ctx context.Context,
 	y string,
 ) *ExportedTypesBFoo {
+	i.dropCollected(ctx)
 	arg0 := y
 	memory0 := i.module.Memory()
 	realloc0 := i.module.ExportedFunction("cabi_realloc")
@@ -1333,7 +1585,7 @@ func (i *ResourcesSharedInstance) NewExportedTypesBFoo(
 	if !ok2 {
 		panic(errors.New("invalid foo handle"))
 	}
-	wrapped2 := &ExportedTypesBFoo{instance: i, rep: resource2}
+	wrapped2 := adoptExportedTypesBFoo(i, resource2)
 	return wrapped2
 }
 
@@ -1341,6 +1593,7 @@ func (self *ExportedTypesBFoo) GetY(
 	ctx context.Context,
 ) string {
 	i := self.instance
+	i.dropCollected(ctx)
 	arg0 := self
 	handle0 := arg0.lend(i)
 	raw1, err1 := i.module.ExportedFunction("arcjet:resources-shared/types-b#[method]foo.get-y").Call(ctx, uint64(handle0))
@@ -1388,6 +1641,7 @@ func (self *ExportedTypesBFoo) SetY(
 	s string,
 ) {
 	i := self.instance
+	i.dropCollected(ctx)
 	arg0 := self
 	arg1 := s
 	handle0 := arg0.lend(i)
@@ -1409,6 +1663,7 @@ func (i *ResourcesSharedInstance) NewExportedBaz(
 	ctx context.Context,
 	count uint32,
 ) *ExportedBaz {
+	i.dropCollected(ctx)
 	arg0 := count
 	result0 := uint32(arg0)
 	raw1, err1 := i.module.ExportedFunction("arcjet:resources-shared/types-b#[constructor]baz").Call(ctx, uint64(result0))
@@ -1437,7 +1692,7 @@ func (i *ResourcesSharedInstance) NewExportedBaz(
 	if !ok2 {
 		panic(errors.New("invalid baz handle"))
 	}
-	wrapped2 := &ExportedBaz{instance: i, rep: resource2}
+	wrapped2 := adoptExportedBaz(i, resource2)
 	return wrapped2
 }
 
@@ -1445,6 +1700,7 @@ func (self *ExportedBaz) Increment(
 	ctx context.Context,
 ) {
 	i := self.instance
+	i.dropCollected(ctx)
 	arg0 := self
 	handle0 := arg0.lend(i)
 	_, err1 := i.module.ExportedFunction("arcjet:resources-shared/types-b#[method]baz.increment").Call(ctx, uint64(handle0))
@@ -1458,6 +1714,7 @@ func (self *ExportedBaz) GetCount(
 	ctx context.Context,
 ) uint32 {
 	i := self.instance
+	i.dropCollected(ctx)
 	arg0 := self
 	handle0 := arg0.lend(i)
 	raw1, err1 := i.module.ExportedFunction("arcjet:resources-shared/types-b#[method]baz.get-count").Call(ctx, uint64(handle0))
@@ -1475,6 +1732,7 @@ func (i *ResourcesSharedInstance) TripleBazCount(
 	ctx context.Context,
 	b *ExportedBaz,
 ) uint32 {
+	i.dropCollected(ctx)
 	arg0 := b
 	handle0 := arg0.lend(i)
 	raw1, err1 := i.module.ExportedFunction("arcjet:resources-shared/types-b#triple-baz-count").Call(ctx, uint64(handle0))
@@ -1492,6 +1750,7 @@ func (i *ResourcesSharedInstance) MakeFoo(
 	ctx context.Context,
 	y string,
 ) *ExportedTypesBFoo {
+	i.dropCollected(ctx)
 	arg0 := y
 	memory0 := i.module.Memory()
 	realloc0 := i.module.ExportedFunction("cabi_realloc")
@@ -1526,7 +1785,7 @@ func (i *ResourcesSharedInstance) MakeFoo(
 	if !ok2 {
 		panic(errors.New("invalid foo handle"))
 	}
-	wrapped2 := &ExportedTypesBFoo{instance: i, rep: resource2}
+	wrapped2 := adoptExportedTypesBFoo(i, resource2)
 	return wrapped2
 }
 

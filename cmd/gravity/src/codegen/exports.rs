@@ -10,7 +10,7 @@ use crate::{
     codegen::imports::{ImportAnalyzer, ImportCodeGenerator},
     go::{
         GoIdentifier, GoResult, GoType, comment,
-        imports::{CONTEXT_CONTEXT, ERRORS_NEW},
+        imports::{CONTEXT_CONTEXT, ERRORS_NEW, RUNTIME_ADD_CLEANUP, RUNTIME_CLEANUP},
     },
 };
 
@@ -23,6 +23,9 @@ pub struct ExportConfig<'a> {
 
 pub struct ExportGenerator<'a> {
     config: ExportConfig<'a>,
+    /// Whether the guest implements any resource, in which case every export
+    /// first destroys the resources whose handles were garbage collected.
+    has_guest_resources: bool,
 }
 
 /// What a generated Go function is a method of.
@@ -36,7 +39,13 @@ enum Receiver<'a> {
 
 impl<'a> ExportGenerator<'a> {
     pub fn new(config: ExportConfig<'a>) -> Self {
-        Self { config }
+        let has_guest_resources = !crate::exported_resources(config.resolve, config.world)
+            .resources
+            .is_empty();
+        Self {
+            config,
+            has_guest_resources,
+        }
     }
 
     /// Generate the Go function code for the given world-level function.
@@ -131,6 +140,16 @@ impl<'a> ExportGenerator<'a> {
                 quote!(i := self.instance),
             ),
         };
+        // Every call into an instance first destroys the guest resources
+        // whose Go handles the garbage collector freed.
+        let prelude = if self.has_guest_resources {
+            quote! {
+                $prelude
+                i.dropCollected(ctx)
+            }
+        } else {
+            prelude
+        };
         quote_in! { *tokens =>
             $['\n']
             func ($receiver) $go_name(
@@ -160,19 +179,35 @@ impl<'a> ExportGenerator<'a> {
         let instance = self.config.instance;
         let go_name_str = String::from(go_name);
         let dtor = format!("{interface_name}#[dtor]{name}");
+        let adopt = &GoIdentifier::private(format!("adopt-{}", go_name_str));
         let dropped = format!("{name} handle used after it was dropped or given away");
         let foreign = format!("{name} handle belongs to another instance");
         quote_in! { *tokens =>
             $['\n']
             $(comment(&[
                 format!("{go_name_str} owns a `{name}` resource, which the guest implements."),
-                "Call Drop when the value is no longer needed, or the guest keeps it until the".to_string(),
-                "instance is closed. A handle belongs to the instance that returned it.".to_string(),
+                "Call Drop when the value is no longer needed. A handle that is garbage".to_string(),
+                "collected without a Drop is destroyed by a later call into its instance,".to_string(),
+                "which can be much later. A handle belongs to the instance that returned it.".to_string(),
             ]))
             type $go_name struct {
                 instance *$instance
                 rep uint32
                 dropped bool
+                $(comment(&["cleanup queues the resource for destruction when the handle is collected."]))
+                cleanup $RUNTIME_CLEANUP
+            }
+            $['\n']
+            $(comment(&[
+                format!("{} wraps a representation the guest handed over in a handle that owns it.", String::from(adopt)),
+            ]))
+            func $adopt(i *$instance, rep uint32) *$go_name {
+                handle := &$go_name{instance: i, rep: rep}
+                handle.cleanup = $RUNTIME_ADD_CLEANUP(handle, i.resources.collect, collectedResource{
+                    dtor: $(quoted(&dtor)),
+                    rep:  rep,
+                })
+                return handle
             }
             $['\n']
             $(comment(&[
@@ -184,7 +219,8 @@ impl<'a> ExportGenerator<'a> {
                     return nil
                 }
                 self.dropped = true
-                if dtor := self.instance.module.ExportedFunction($(quoted(dtor))); dtor != nil {
+                self.cleanup.Stop()
+                if dtor := self.instance.module.ExportedFunction($(quoted(&dtor))); dtor != nil {
                     if _, err := dtor.Call(ctx, uint64(self.rep)); err != nil {
                         return err
                     }
@@ -212,6 +248,7 @@ impl<'a> ExportGenerator<'a> {
             func (self *$go_name) give(i *$instance) uint32 {
                 rep := self.lend(i)
                 self.dropped = true
+                self.cleanup.Stop()
                 return rep
             }
         }
@@ -235,18 +272,22 @@ impl<'a> ExportGenerator<'a> {
         );
 
         // The import side already generated the data types of an interface
-        // that is also imported.
-        if !imported {
-            let analyzer = ImportAnalyzer::new(resolve, self.config.world);
-            for &type_id in interface.types.values() {
-                if let Some(typ) = analyzer.analyze_type(type_id) {
-                    ImportCodeGenerator::generate_type_definition(&typ, tokens);
-                }
+        // that is also imported, except the ones that hold a handle to a
+        // resource the guest implements: those differ on this side and get a
+        // second Go type.
+        let analyzer =
+            ImportAnalyzer::new(resolve, self.config.world).with_exported(exported.clone());
+        for &type_id in interface.types.values() {
+            if imported && !exported.types.contains_key(&type_id) {
+                continue;
+            }
+            if let Some(typ) = analyzer.analyze_type(type_id) {
+                ImportCodeGenerator::generate_type_definition(&typ, tokens);
             }
         }
 
         for (name, &type_id) in &interface.types {
-            if let Some(go_name) = exported.get(&type_id) {
+            if let Some(go_name) = exported.resources.get(&type_id) {
                 self.generate_resource_type(
                     name,
                     &GoIdentifier::public(go_name),
@@ -261,7 +302,7 @@ impl<'a> ExportGenerator<'a> {
             let go_name = Self::go_function_name(func, resolve, exported);
             match func.kind {
                 FunctionKind::Method(resource) => {
-                    let resource = GoIdentifier::public(&exported[&resource]);
+                    let resource = GoIdentifier::public(&exported.resources[&resource]);
                     self.generate_export(
                         func,
                         &export_name,
@@ -304,8 +345,8 @@ impl<'a> ExportGenerator<'a> {
     ) -> String {
         let item = || func.name.split_once('.').map_or("", |(_, item)| item);
         match func.kind {
-            FunctionKind::Constructor(id) => format!("new-{}", exported[&id]),
-            FunctionKind::Static(id) => format!("{}-{}", exported[&id], item()),
+            FunctionKind::Constructor(id) => format!("new-{}", exported.resources[&id]),
+            FunctionKind::Static(id) => format!("{}-{}", exported.resources[&id], item()),
             _ => crate::function_go_name(func, resolve),
         }
     }
@@ -520,7 +561,19 @@ mod tests {
         assert!(generated.contains("func (i *TestInstance) ThingJoin("));
         assert!(generated.contains("ExportedFunction(\"test:fixture/things#[constructor]thing\")"));
         assert!(generated.contains("i.resources.exportedThing.take(uint32("));
-        assert!(generated.contains("&Thing{instance: i, rep: "));
+        assert!(generated.contains("wrapped2 := adoptThing(i, resource2)"));
+
+        // A handle the garbage collector frees is queued for destruction, a
+        // dropped or given one is not, and every export empties the queue.
+        assert!(generated.contains(
+            "handle.cleanup = runtime.AddCleanup(handle, i.resources.collect, collectedResource{"
+        ));
+        assert_eq!(generated.matches("self.cleanup.Stop()").count(), 2);
+        assert_eq!(
+            generated.matches("i.dropCollected(ctx)").count(),
+            4,
+            "the constructor, the method, the static function and the free function"
+        );
 
         // A method is a Go method of the handle type and lends `self`.
         assert!(generated.contains("func (self *Thing) Get("));
@@ -561,6 +614,73 @@ mod tests {
         assert!(generated.contains("i.resources.importedThing.add(arg0, false)"));
         assert!(generated.contains("i.resources.importedThing.add(arg0, true)"));
         assert!(generated.contains("i.resources.importedThing.take(uint32("));
+
+        // Only the export that lends a borrow checks that the guest gave it
+        // back, and it has no guest resources to collect.
+        assert_eq!(
+            generated
+                .matches("if i.resources.importedThing.dropBorrows() != 0 {")
+                .count(),
+            1
+        );
+        assert!(generated.contains("guest kept a borrowed thing handle after the call returned"));
+        assert!(!generated.contains("dropCollected"));
+    }
+
+    /// A record or variant that holds a handle to a resource the guest
+    /// implements holds the Go handle type. When the interface is also
+    /// imported, the import side already owns the plain name, so the guest's
+    /// side of the type is generated again under a prefixed name.
+    #[test]
+    fn test_exported_resource_in_record_and_variant() {
+        let wit = |imports: &str| {
+            format!(
+                "package test:fixture;
+                interface things {{
+                    resource thing {{
+                        constructor();
+                    }}
+                    record boxed {{ thing: thing, size: u32 }}
+                    variant slot {{ empty, full(thing) }}
+                    record plain {{ size: u32 }}
+                    pack: func(size: u32) -> boxed;
+                    unpack: func(b: boxed) -> slot;
+                    measure: func(p: plain) -> plain;
+                }}
+                world test-world {{
+                    {imports}
+                    export things;
+                }}"
+            )
+        };
+
+        let generated = generate_world(&Fixture::parse(&wit("")));
+        println!("Exported only:\n{generated}");
+        assert!(generated.contains("type Boxed struct {\n    Thing *Thing\n    Size uint32\n}"));
+        assert!(generated.contains("type SlotFull struct {\n    Value *Thing\n}"));
+        assert!(generated.contains("type Plain struct {"));
+        assert!(generated.contains(") Boxed {"));
+        assert!(generated.contains("b Boxed,"));
+
+        let generated = generate_world(&Fixture::parse(&wit("import things;")));
+        println!("Imported and exported:\n{generated}");
+        assert!(
+            generated.contains(
+                "type ExportedBoxed struct {\n    Thing *ExportedThing\n    Size uint32\n}"
+            )
+        );
+        assert!(generated.contains("type ExportedSlotFull struct {\n    Value *ExportedThing\n}"));
+        assert!(generated.contains(") ExportedBoxed {"));
+        assert!(generated.contains("b ExportedBoxed,"));
+        assert!(generated.contains(":= ExportedBoxed{"));
+        assert!(
+            generated.contains("case ExportedSlotFull:")
+                || generated.contains("ExportedSlotFull{Value: ")
+        );
+        // A type without a handle is the same on both sides: the import side
+        // generates it once.
+        assert!(!generated.contains("type Plain struct {"));
+        assert!(!generated.contains("ExportedPlain"));
     }
 
     /// An interface that is both imported and exported declares each resource

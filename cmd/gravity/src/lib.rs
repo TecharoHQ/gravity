@@ -48,9 +48,20 @@ pub fn case_dispatch_kind(case: &Case, resolve: &Resolve) -> CaseDispatchKind {
 /// Kebab-case Go name for the type a variant case dispatches against in a
 /// type-switch.
 pub fn case_dispatch_name(variant_name: &str, case: &Case, resolve: &Resolve) -> String {
+    case_dispatch_name_in(variant_name, case, resolve, &ExportedResources::new())
+}
+
+/// Like [`case_dispatch_name`], naming the payload record as `exported` sees
+/// it.
+pub fn case_dispatch_name_in(
+    variant_name: &str,
+    case: &Case,
+    resolve: &Resolve,
+    exported: &ExportedResources,
+) -> String {
     match case_dispatch_kind(case, resolve) {
         CaseDispatchKind::DirectRecord => match case.ty {
-            Some(Type::Id(payload_id)) => qualified_type_name(payload_id, resolve),
+            Some(Type::Id(payload_id)) => exported.type_name(payload_id, resolve),
             _ => unreachable!("DirectRecord requires a Type::Id payload"),
         },
         CaseDispatchKind::Wrapped => format!("{variant_name}-{}", case.name),
@@ -96,16 +107,64 @@ pub fn qualified_type_name(type_id: TypeId, resolve: &Resolve) -> String {
     }
 }
 
-/// The resources the guest implements, keyed by resource type, with the
-/// kebab-case name of the Go handle type gravity generates for each.
+/// The types that look different from the guest's side of the world.
 ///
 /// wit-parser gives a resource one `TypeId` even when its interface is both
 /// imported and exported, so the type alone does not say who implements it.
-/// This map is the answer for one function: functions of an exported
-/// interface use [`exported_resources`], every other function uses an empty
-/// map, because a world-level function and an import can only name the
-/// imported side of an interface.
-pub type ExportedResources = BTreeMap<TypeId, String>;
+/// This is the answer for one function: functions of an exported interface
+/// use [`exported_resources`], every other function uses an empty value,
+/// because a world-level function and an import can only name the imported
+/// side of an interface.
+#[derive(Debug, Clone, Default)]
+pub struct ExportedResources {
+    /// The resources the guest implements, with the kebab-case name of the Go
+    /// handle type gravity generates for each.
+    pub resources: BTreeMap<TypeId, String>,
+    /// The records and variants that hold a handle to one of `resources` and
+    /// whose interface is also imported, with the kebab-case name of their
+    /// guest-side Go type. Such a type exists twice in Go: the imported side
+    /// holds the host's Go value, the exported side the guest's handle.
+    pub types: BTreeMap<TypeId, String>,
+}
+
+impl ExportedResources {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Kebab-case Go name of the named type `id` on this side of the world.
+    pub fn type_name(&self, id: TypeId, resolve: &Resolve) -> String {
+        match self.types.get(&dealias(resolve, id)) {
+            Some(name) => name.clone(),
+            None => qualified_type_name(id, resolve),
+        }
+    }
+}
+
+/// Whether `typ` holds, at any depth, a handle to one of `resources`.
+fn holds_handle_to(typ: &Type, resolve: &Resolve, resources: &BTreeMap<TypeId, String>) -> bool {
+    let holds = |typ: &Type| holds_handle_to(typ, resolve, resources);
+    let Type::Id(id) = typ else {
+        return false;
+    };
+    match &resolve.types[*id].kind {
+        TypeDefKind::Handle(handle) => resources.contains_key(&handle_resource(handle, resolve).0),
+        TypeDefKind::Record(record) => record.fields.iter().any(|field| holds(&field.ty)),
+        TypeDefKind::Variant(variant) => variant.cases.iter().any(|case| case.ty.iter().any(holds)),
+        TypeDefKind::Tuple(tuple) => tuple.types.iter().any(holds),
+        TypeDefKind::Result(result) => result.ok.iter().chain(result.err.iter()).any(holds),
+        TypeDefKind::Option(inner)
+        | TypeDefKind::List(inner)
+        | TypeDefKind::FixedLengthList(inner, _)
+        | TypeDefKind::Type(inner) => holds(inner),
+        TypeDefKind::Map(key, value) => holds(key) || holds(value),
+        TypeDefKind::Future(inner) | TypeDefKind::Stream(inner) => inner.iter().any(holds),
+        TypeDefKind::Resource
+        | TypeDefKind::Flags(_)
+        | TypeDefKind::Enum(_)
+        | TypeDefKind::Unknown => false,
+    }
+}
 
 /// Whether `world` imports the interface `owner`.
 fn world_imports_interface(world: &World, owner: TypeOwner) -> bool {
@@ -137,7 +196,27 @@ pub fn exported_resources(resolve: &Resolve, world: &World) -> ExportedResources
             } else {
                 name
             };
-            exported.insert(type_id, name);
+            exported.resources.insert(type_id, name);
+        }
+    }
+
+    // A record or variant that holds one of those handles needs a second Go
+    // type when the import side already generated one under the plain name.
+    for item in world.exports.values() {
+        let WorldItem::Interface { id, .. } = item else {
+            continue;
+        };
+        for &type_id in resolve.interfaces[*id].types.values() {
+            let type_def = &resolve.types[type_id];
+            if matches!(
+                type_def.kind,
+                TypeDefKind::Record(_) | TypeDefKind::Variant(_)
+            ) && world_imports_interface(world, type_def.owner)
+                && holds_handle_to(&Type::Id(type_id), resolve, &exported.resources)
+            {
+                let name = qualified_type_name(type_id, resolve);
+                exported.types.insert(type_id, format!("exported-{name}"));
+            }
         }
     }
     exported
@@ -254,21 +333,21 @@ pub fn resolve_type_in(typ: &Type, resolve: &Resolve, exported: &ExportedResourc
                 .get(*id)
                 .expect("failed to find type definition");
             match kind {
-                TypeDefKind::Record(_) => GoType::UserDefined(qualified_type_name(*id, resolve)),
+                TypeDefKind::Record(_) => GoType::UserDefined(exported.type_name(*id, resolve)),
                 TypeDefKind::Resource => {
                     panic!("a resource is only usable through an own or borrow handle")
                 }
                 TypeDefKind::Handle(handle) => {
                     let (resource, _) = handle_resource(handle, resolve);
-                    match exported.get(&resource) {
+                    match exported.resources.get(&resource) {
                         Some(name) => GoType::Pointer(Box::new(GoType::UserDefined(name.clone()))),
                         None => GoType::UserDefined(qualified_type_name(resource, resolve)),
                     }
                 }
                 TypeDefKind::Flags(_) => todo!("TODO(#4): implement flag conversion"),
                 TypeDefKind::Tuple(_) => todo!("TODO(#4): implement tuple conversion"),
-                TypeDefKind::Variant(_) => GoType::UserDefined(qualified_type_name(*id, resolve)),
-                TypeDefKind::Enum(_) => GoType::UserDefined(qualified_type_name(*id, resolve)),
+                TypeDefKind::Variant(_) => GoType::UserDefined(exported.type_name(*id, resolve)),
+                TypeDefKind::Enum(_) => GoType::UserDefined(exported.type_name(*id, resolve)),
                 // `option<T>` is `*T`: `nil` is `none`, `&v` is `some`. A
                 // single pointer composes in every position (param, return,
                 // record field, list element); the prior `(T, bool)`
@@ -310,7 +389,7 @@ pub fn resolve_type_in(typ: &Type, resolve: &Resolve, exported: &ExportedResourc
                 }
                 TypeDefKind::Future(_) => todo!("TODO(#4): implement future conversion"),
                 TypeDefKind::Stream(_) => todo!("TODO(#4): implement stream conversion"),
-                TypeDefKind::Type(_) => GoType::UserDefined(qualified_type_name(*id, resolve)),
+                TypeDefKind::Type(_) => GoType::UserDefined(exported.type_name(*id, resolve)),
                 TypeDefKind::FixedLengthList(_, _) => {
                     todo!("TODO(#4): implement fixed length list conversion")
                 }

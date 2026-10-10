@@ -252,6 +252,8 @@ impl<'a> FactoryGenerator<'a> {
                 mu      $SYNC_MUTEX
                 entries []resourceHandle[T]
                 free    []uint32
+                $(comment(&["borrows counts the live handles that do not own their value."]))
+                borrows int
             }
             $['\n']
             $(comment(&["add stores value and returns its new handle."]))
@@ -259,6 +261,9 @@ impl<'a> FactoryGenerator<'a> {
                 t.mu.Lock()
                 defer t.mu.Unlock()
                 entry := resourceHandle[T]{value: value, own: own, live: true}
+                if !own {
+                    t.borrows++
+                }
                 if n := len(t.free); n > 0 {
                     handle := t.free[n-1]
                     t.free = t.free[:n-1]
@@ -296,9 +301,34 @@ impl<'a> FactoryGenerator<'a> {
                     return value, false, false
                 }
                 value, own = entry.value, entry.own
+                if !own {
+                    t.borrows--
+                }
                 *entry = resourceHandle[T]{}
                 t.free = append(t.free, handle)
                 return value, own, true
+            }
+            $['\n']
+            $(comment(&[
+                "dropBorrows removes the borrowed handles that are still in the table and",
+                "returns how many there were. A borrow ends with the call that lent it, so",
+                "the guest must have dropped every one by the time the call returns.",
+            ]))
+            func (t *resourceTable[T]) dropBorrows() int {
+                t.mu.Lock()
+                defer t.mu.Unlock()
+                kept := t.borrows
+                if kept == 0 {
+                    return 0
+                }
+                for index := range t.entries {
+                    if entry := &t.entries[index]; entry.live && !entry.own {
+                        *entry = resourceHandle[T]{}
+                        t.free = append(t.free, uint32(index+1))
+                    }
+                }
+                t.borrows = 0
+                return kept
             }
             $['\n']
             $(comment(&[
@@ -326,6 +356,60 @@ impl<'a> FactoryGenerator<'a> {
             type $tables_name struct {
                 $(for (field, typ) in &resources.imported join ($['\r']) => $field resourceTable[$typ])
                 $(for field in &resources.exported join ($['\r']) => $field resourceTable[uint32])
+                $(if !resources.exported.is_empty() {
+                    $(comment(&[
+                        "collected lists the guest resources whose Go handles the garbage",
+                        "collector freed before anyone dropped them.",
+                    ]))
+                    collectedMu $SYNC_MUTEX
+                    collected   []collectedResource
+                })
+            }
+            $['\n']
+        };
+        if resources.exported.is_empty() {
+            return;
+        }
+
+        let instance_name = &self.config.analyzed_imports.instance_name;
+        quote_in! { *tokens =>
+            $(comment(&[
+                "collectedResource names a guest resource to destroy: the guest's destructor",
+                "export and the resource's representation.",
+            ]))
+            type collectedResource struct {
+                dtor string
+                rep  uint32
+            }
+            $['\n']
+            $(comment(&[
+                "collect queues a resource for destruction. The garbage collector calls it",
+                "from its own goroutine when a handle is freed. A module instance is not safe",
+                "for concurrent use, so the destructor cannot run here: the next call into",
+                "the instance runs it.",
+            ]))
+            func (t *$tables_name) collect(resource collectedResource) {
+                t.collectedMu.Lock()
+                defer t.collectedMu.Unlock()
+                t.collected = append(t.collected, resource)
+            }
+            $['\n']
+            $(comment(&[
+                "dropCollected runs the guest's destructor for every resource whose handle",
+                "the garbage collector freed since the last call.",
+            ]))
+            func (i *$instance_name) dropCollected(ctx $CONTEXT_CONTEXT) {
+                i.resources.collectedMu.Lock()
+                collected := i.resources.collected
+                i.resources.collected = nil
+                i.resources.collectedMu.Unlock()
+                for _, resource := range collected {
+                    if dtor := i.module.ExportedFunction(resource.dtor); dtor != nil {
+                        if _, err := dtor.Call(ctx, uint64(resource.rep)); err != nil {
+                            panic(err)
+                        }
+                    }
+                }
             }
             $['\n']
         };

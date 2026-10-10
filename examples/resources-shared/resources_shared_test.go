@@ -57,6 +57,9 @@ func (a hostA) NewBar(ctx context.Context, value string) Bar   { return &bar{val
 func (a hostA) DoubleFooX(ctx context.Context, f TypesAFoo) uint32 {
 	return f.GetX(ctx) * 2
 }
+func (a hostA) LabelFoo(ctx context.Context, label string, x uint32) Labeled {
+	return Labeled{Label: label, Foo: &fooA{x: x, h: a.h}}
+}
 func (a hostA) MakeBar(ctx context.Context, value string) Bar { return &bar{value: value, h: a.h} }
 
 type hostB struct{ h *host }
@@ -91,13 +94,13 @@ func setup(t *testing.T) (*host, *ResourcesSharedInstance) {
 func TestHostSide(t *testing.T) {
 	h, ins := setup(t)
 
-	const want = "ybar!;33;made"
+	const want = "ybar!;33;made;label=7"
 	if got := ins.UseHost(t.Context(), 4, "y"); got != want {
 		t.Errorf("wanted: %s, but got: %s", want, got)
 	}
-	// The guest made five resources and dropped them all when it returned.
-	if h.dropped != 5 {
-		t.Errorf("wanted 5 dropped resources, but got: %d", h.dropped)
+	// The guest made six resources and dropped them all when it returned.
+	if h.dropped != 6 {
+		t.Errorf("wanted 6 dropped resources, but got: %d", h.dropped)
 	}
 }
 
@@ -132,6 +135,20 @@ func TestGuestSide(t *testing.T) {
 	baz.Increment(ctx)
 	if got := ins.TripleBazCount(ctx, baz); got != 6 {
 		t.Errorf("wanted: 6, but got: %d", got)
+	}
+
+	// The record exists twice: Labeled holds the host's TypesAFoo, and
+	// ExportedLabeled holds the guest's handle.
+	var labeled ExportedLabeled = ins.LabelFoo(ctx, "label", 3)
+	if labeled.Label != "label" {
+		t.Errorf("wanted: label, but got: %s", labeled.Label)
+	}
+	var labeledFoo *ExportedTypesAFoo = labeled.Foo
+	if got := labeledFoo.GetX(ctx); got != 3 {
+		t.Errorf("wanted: 3, but got: %d", got)
+	}
+	if err := labeledFoo.Drop(ctx); err != nil {
+		t.Error(err)
 	}
 
 	for _, drop := range []func(context.Context) error{foo.Drop, made.Drop, fooB.Drop, baz.Drop} {

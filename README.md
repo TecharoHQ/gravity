@@ -117,6 +117,14 @@ type IResourcesHost interface {
 When the guest drops a handle that owns a value, Gravity calls the value's
 `ResourceDrop(ctx context.Context)` method, if the value has one.
 
+A guest that borrows a resource for a call must give the handle back before it
+returns. If it does not, the call fails: it returns an error when the function
+can return one, and panics otherwise.
+
+A resource declared in the world itself works the same way. Its functions and
+the world's own imported functions go into one more Go interface,
+`I<World>World`, which the factory takes as a parameter.
+
 A resource in an exported interface is implemented by the guest. Gravity
 generates a Go handle type with one method for each WIT method. The constructor
 and the static functions become methods of the instance:
@@ -130,8 +138,13 @@ err := acc.Drop(ctx) // runs the guest's destructor
 
 A handle owns its resource. Call `Drop` when you no longer need it. If you pass
 a handle to a function that takes the resource by value, the guest owns the
-resource again and the Go handle can no longer be used. Gravity does not drop a
-handle when the Go garbage collector frees it.
+resource again and the Go handle can no longer be used.
+
+If the garbage collector frees a handle that was not dropped, Gravity destroys
+the resource with `runtime.AddCleanup`, so the generated code needs Go 1.24 or
+later. An instance is not safe for concurrent use, so the destructor does not
+run in the collector's goroutine. It runs at the start of the next call into
+the instance. `Drop` is the only way to destroy a resource at a known time.
 
 Each instance has its own handle tables, so a handle from one instance cannot be
 used with a different instance. See [examples/resources](./examples/resources/)

@@ -50,6 +50,9 @@ pub struct Func<'a> {
     /// The name the guest exports the function under, when it differs from
     /// the WIT function name (`arcjet:resources/guest#make` for `make`).
     export_name: Option<String>,
+    /// The handle tables this export lent a borrowed handle from, with the
+    /// resource's name. The guest must drop those handles before it returns.
+    lent: Vec<(String, String)>,
 }
 
 impl<'a> Func<'a> {
@@ -67,6 +70,7 @@ impl<'a> Func<'a> {
             sizes,
             exported: ExportedResources::new(),
             export_name: None,
+            lent: Vec::new(),
         }
     }
 
@@ -83,6 +87,7 @@ impl<'a> Func<'a> {
             sizes,
             exported: ExportedResources::new(),
             export_name: None,
+            lent: Vec::new(),
         }
     }
 
@@ -104,8 +109,11 @@ impl<'a> Func<'a> {
     /// function is shared by every instance, so it finds the tables of the
     /// module that called it.
     fn resource_table(&self, resource: TypeId, resolve: &Resolve) -> String {
-        let field =
-            crate::resource_table_field(resource, resolve, self.exported.contains_key(&resource));
+        let field = crate::resource_table_field(
+            resource,
+            resolve,
+            self.exported.resources.contains_key(&resource),
+        );
         let field = String::from(GoIdentifier::private(field));
         match self.direction {
             Direction::Export => format!("i.resources.{field}"),
@@ -365,6 +373,14 @@ impl Bindgen for Func<'_> {
                         GoResult::Empty => (),
                     })
                 };
+                // A borrow ends with the call. The Component Model traps a
+                // guest that returns while it still holds a borrowed handle.
+                for (table, resource) in mem::take(&mut self.lent) {
+                    self.fail_if(
+                        &format!("{table}.dropBorrows() != 0"),
+                        &format!("guest kept a borrowed {resource} handle after the call returned"),
+                    );
+                }
                 match self.result {
                     GoResult::Empty => (),
                     GoResult::Anon(_) => results.push(Operand::SingleValue(ret.into())),
@@ -928,7 +944,8 @@ impl Bindgen for Func<'_> {
                     results.push(Operand::SingleValue(var.into()))
                 }
             }
-            Instruction::RecordLift { record, name, .. } => {
+            Instruction::RecordLift { record, ty, .. } => {
+                let name = &self.exported.type_name(*ty, resolve);
                 let tmp = self.tmp();
                 let value = &format!("value{tmp}");
                 let fields = record
@@ -939,7 +956,7 @@ impl Bindgen for Func<'_> {
 
                 quote_in! {self.body =>
                     $['\r']
-                    $value := $(GoIdentifier::public(*name)){
+                    $value := $(GoIdentifier::public(name)){
                         $(for (name, op) in fields join ($['\r']) => $name: $op,)
                     }
                 };
@@ -1034,7 +1051,7 @@ impl Bindgen for Func<'_> {
                 results: result_types,
                 ..
             } => {
-                let name = crate::qualified_type_name(*ty, resolve);
+                let name = self.exported.type_name(*ty, resolve);
                 let blocks = self
                     .blocks
                     .drain(self.blocks.len() - variant.cases.len()..)
@@ -1080,8 +1097,12 @@ impl Bindgen for Func<'_> {
                         };
                     }
 
-                    let case_type =
-                        GoIdentifier::public(crate::case_dispatch_name(&name, case, resolve));
+                    let case_type = GoIdentifier::public(crate::case_dispatch_name_in(
+                        &name,
+                        case,
+                        resolve,
+                        &self.exported,
+                    ));
                     let payload_intro = if all_direct {
                         quote!()
                     } else {
@@ -1508,7 +1529,7 @@ impl Bindgen for Func<'_> {
             Instruction::FlagsLower { .. } => todo!("implement instruction: {inst:?}"),
             Instruction::FlagsLift { .. } => todo!("implement instruction: {inst:?}"),
             Instruction::VariantLift { variant, ty, .. } => {
-                let name = crate::qualified_type_name(*ty, resolve);
+                let name = self.exported.type_name(*ty, resolve);
                 let blocks = self
                     .blocks
                     .drain(self.blocks.len() - variant.cases.len()..)
@@ -1522,8 +1543,12 @@ impl Bindgen for Func<'_> {
                 for (i, (case, (block, block_results))) in
                     variant.cases.iter().zip(blocks).enumerate()
                 {
-                    let case_type =
-                        GoIdentifier::public(crate::case_dispatch_name(&name, case, resolve));
+                    let case_type = GoIdentifier::public(crate::case_dispatch_name_in(
+                        &name,
+                        case,
+                        resolve,
+                        &self.exported,
+                    ));
                     let payload = block_results.first();
                     let construction = match crate::case_dispatch_kind(case, resolve) {
                         crate::CaseDispatchKind::DirectRecord => {
@@ -1569,7 +1594,7 @@ impl Bindgen for Func<'_> {
                 results.push(Operand::SingleValue(value.to_string()));
             }
             Instruction::EnumLift { enum_, ty, .. } => {
-                let name = crate::qualified_type_name(*ty, resolve);
+                let name = self.exported.type_name(*ty, resolve);
                 let discriminant = &operands[0];
                 let tmp = self.tmp();
                 let enum_value = &format!("enum{tmp}");
@@ -1657,13 +1682,13 @@ impl Bindgen for Func<'_> {
                 results.push(Operand::SingleValue(ptr.into()));
             }
             // Hands a resource to the guest as a `u32`.
-            Instruction::HandleLower { handle, .. } => {
+            Instruction::HandleLower { handle, name, .. } => {
                 let (resource, owned) = crate::handle_resource(handle, resolve);
                 let table = &self.resource_table(resource, resolve);
                 let tmp = self.tmp();
                 let result = &format!("handle{tmp}");
                 let operand = &operands[0];
-                if self.exported.contains_key(&resource) {
+                if self.exported.resources.contains_key(&resource) {
                     // The guest implements the resource. It receives a
                     // borrow as the representation itself, with no handle in
                     // between, and an owned value as a new handle, after
@@ -1684,6 +1709,12 @@ impl Bindgen for Func<'_> {
                     // handle to the Go value: an owning one, or a borrowed
                     // one that it drops before it returns.
                     let own = if owned { "true" } else { "false" };
+                    if !owned
+                        && matches!(self.direction, Direction::Export)
+                        && !self.lent.iter().any(|(lent, _)| lent == table)
+                    {
+                        self.lent.push((table.clone(), name.to_string()));
+                    }
                     quote_in! { self.body =>
                         $['\r']
                         $result := $table.add($operand, $own)
@@ -1707,15 +1738,17 @@ impl Bindgen for Func<'_> {
                     $value, $ok := $table.$lookup(uint32($operand))
                 };
                 self.fail_if(&format!("!{ok}"), &format!("invalid {name} handle"));
-                match self.exported.get(&resource) {
+                match self.exported.resources.get(&resource) {
                     Some(go_name) => {
                         // The table held the guest's representation; wrap it
                         // in the Go handle type.
                         let go_name = &GoIdentifier::public(go_name);
+                        let adopt =
+                            &GoIdentifier::private(format!("adopt-{}", String::from(go_name)));
                         let wrapped = &format!("wrapped{tmp}");
                         quote_in! { self.body =>
                             $['\r']
-                            $wrapped := &$go_name{instance: i, rep: $value}
+                            $wrapped := $adopt(i, $value)
                         };
                         results.push(Operand::SingleValue(wrapped.into()));
                     }
