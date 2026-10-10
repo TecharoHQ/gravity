@@ -1,0 +1,2 @@
+bin.name = "gravity"
+args = "--world resources ../../target/wasm32-unknown-unknown/release/example_resources.wasm"

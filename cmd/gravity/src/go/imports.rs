@@ -38,3 +38,7 @@ pub static WAZERO_API_DECODE_F64: GoImport =
     GoImport("github.com/tetratelabs/wazero/api", "DecodeF64");
 pub static REFLECT_VALUE_OF: GoImport = GoImport("reflect", "ValueOf");
 pub static UTF8_VALID_RUNE: GoImport = GoImport("unicode/utf8", "ValidRune");
+pub static SYNC_MAP: GoImport = GoImport("sync", "Map");
+pub static SYNC_MUTEX: GoImport = GoImport("sync", "Mutex");
+pub static ATOMIC_UINT64: GoImport = GoImport("sync/atomic", "Uint64");
+pub static STRCONV_FORMAT_UINT: GoImport = GoImport("strconv", "FormatUint");

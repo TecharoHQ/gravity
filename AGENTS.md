@@ -127,6 +127,8 @@ examples/
   iface-method-returns-string/  # Interface method returning a string
   instructions/          # Tests various canonical ABI instructions
   regressions/           # Regression tests for import codegen edge cases
+  resources/             # Resources the host implements and resources the guest implements
+  resources-shared/      # Interfaces both imported and exported, with clashing resource names
 
 justfile                 # Recipes for building, testing and the CI gate
 ```
@@ -192,6 +194,35 @@ load manifest"; `just clean-examples` removes them.
   (the fixed `ctx`/`mod` params and any WIT-level params) are collected into a
   single `Vec` before the `quote!` template. This ensures the `join` macro
   produces correct commas even when there are zero WIT-level parameters.
+- **Resources.** A handle is a `u32` index into a table that belongs to one
+  module instance. Who implements the resource decides everything else:
+  - _Imported interface, host implements._ The Go type is an interface
+    (`Counter`). The table holds Go values. The host module for the interface
+    exports `[resource-drop]<name>` next to the interface's functions.
+  - _Exported interface, guest implements._ The Go type is a pointer to a
+    generated handle struct (`*Accumulator`) holding the guest's `u32`
+    representation. The table holds representations. The guest imports
+    `[resource-new]`, `[resource-rep]` and `[resource-drop]` from the host
+    module `[export]<interface>`, and exports its functions as
+    `<interface>#<function>` and its destructor as `<interface>#[dtor]<name>`.
+    The guest receives a `borrow` of its own resource as the bare
+    representation, not as a handle.
+
+  wit-parser gives a resource one `TypeId` even when its interface is both
+  imported and exported, so the type alone does not say who implements it.
+  `ExportedResources` (lib.rs) carries the answer: functions of an exported
+  interface get the map from `exported_resources()`, every other function gets
+  an empty map. Use the `resolve_type_in` family, not `resolve_type`, wherever
+  a function of an exported interface resolves a type.
+
+  The host modules are instantiated once per factory and shared by all of its
+  instances. `Instantiate` gives each module instance a unique name and
+  registers its tables under it; a host function finds them with
+  `resourcesOf(mod)`. Worlds without resources do not get any of this, so their
+  output is unchanged.
+
+  Not implemented: a resource declared in the world itself, and a record or
+  variant that holds a handle to a resource the guest implements.
 
 ## Key Dependencies
 
@@ -218,6 +249,10 @@ Bump every example's pins with them.
   in the `instructions` example and update snapshot tests
 - When changing codegen output, update snapshot `.stdout` files with
   `just update-snapshots`
+- An example that exports an interface must start with
+  `#![cfg(target_arch = "wasm32")]`. `just build` also compiles every example
+  for the host, and a native linker rejects export names such as
+  `arcjet:resources/guest#[constructor]accumulator`.
 
 ## Adding a New Example
 

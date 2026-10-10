@@ -93,6 +93,50 @@ This list is likely to grow quickly, as one of our goals is to avoid working
 with JSON serialized as a string and instead leverage more concrete types that
 we can codegen.
 
+### Resources
+
+Gravity supports WIT resources in both directions, with `own<T>` and
+`borrow<T>` handles in parameters and results.
+
+A resource in an imported interface is implemented by the host. Gravity
+generates a Go interface with one method for each WIT method. The constructor
+and the static functions become methods of the Go interface for the WIT
+interface. The guest holds handles to your Go values:
+
+```go
+// resource counter { constructor(start: u32); get: func() -> u32; }
+type Counter interface {
+	Get(ctx context.Context) uint32
+}
+
+type IResourcesHost interface {
+	NewCounter(ctx context.Context, start uint32) Counter
+}
+```
+
+When the guest drops a handle that owns a value, Gravity calls the value's
+`ResourceDrop(ctx context.Context)` method, if the value has one.
+
+A resource in an exported interface is implemented by the guest. Gravity
+generates a Go handle type with one method for each WIT method. The constructor
+and the static functions become methods of the instance:
+
+```go
+acc := instance.NewAccumulator(ctx, "label")
+acc.Add(ctx, 2)
+total := acc.Total(ctx)
+err := acc.Drop(ctx) // runs the guest's destructor
+```
+
+A handle owns its resource. Call `Drop` when you no longer need it. If you pass
+a handle to a function that takes the resource by value, the guest owns the
+resource again and the Go handle can no longer be used. Gravity does not drop a
+handle when the Go garbage collector frees it.
+
+Each instance has its own handle tables, so a handle from one instance cannot be
+used with a different instance. See [examples/resources](./examples/resources/)
+and [examples/resources-shared](./examples/resources-shared/).
+
 ## Output
 
 The generated output consists of a bindings file and a Wasm file which

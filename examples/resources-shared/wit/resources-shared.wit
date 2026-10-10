@@ -1,0 +1,49 @@
+package arcjet:resources-shared;
+
+// The world imports and exports both interfaces, so every resource exists
+// twice: once implemented by the host and once by the guest. Both interfaces
+// declare a resource named `foo`.
+
+interface types-a {
+  resource foo {
+    constructor(x: u32);
+    get-x: func() -> u32;
+    set-x: func(n: u32);
+  }
+
+  resource bar {
+    constructor(value: string);
+    get-value: func() -> string;
+    append: func(s: string);
+  }
+
+  double-foo-x: func(f: borrow<foo>) -> u32;
+  make-bar: func(value: string) -> bar;
+}
+
+interface types-b {
+  resource foo {
+    constructor(y: string);
+    get-y: func() -> string;
+    set-y: func(s: string);
+  }
+
+  resource baz {
+    constructor(count: u32);
+    increment: func();
+    get-count: func() -> u32;
+  }
+
+  triple-baz-count: func(b: borrow<baz>) -> u32;
+  make-foo: func(y: string) -> foo;
+}
+
+world resources-shared {
+  import types-a;
+  import types-b;
+  export types-a;
+  export types-b;
+
+  /// Uses the host's side of both interfaces.
+  export use-host: func(x: u32, y: string) -> string;
+}

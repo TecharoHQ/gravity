@@ -1,11 +1,16 @@
 pub mod codegen;
 pub mod go;
 
+use std::collections::BTreeMap;
+
 use crate::go::GoType;
 use wit_bindgen_core::{
     abi::WasmType,
     dealias,
-    wit_parser::{Case, Resolve, Result_, Type, TypeDef, TypeDefKind, TypeId, TypeOwner},
+    wit_parser::{
+        Case, Function, FunctionKind, Handle, Resolve, Result_, Type, TypeDef, TypeDefKind, TypeId,
+        TypeOwner, World, WorldItem,
+    },
 };
 
 // Temporary re-export while we migrate.
@@ -91,6 +96,105 @@ pub fn qualified_type_name(type_id: TypeId, resolve: &Resolve) -> String {
     }
 }
 
+/// The resources the guest implements, keyed by resource type, with the
+/// kebab-case name of the Go handle type gravity generates for each.
+///
+/// wit-parser gives a resource one `TypeId` even when its interface is both
+/// imported and exported, so the type alone does not say who implements it.
+/// This map is the answer for one function: functions of an exported
+/// interface use [`exported_resources`], every other function uses an empty
+/// map, because a world-level function and an import can only name the
+/// imported side of an interface.
+pub type ExportedResources = BTreeMap<TypeId, String>;
+
+/// Whether `world` imports the interface `owner`.
+fn world_imports_interface(world: &World, owner: TypeOwner) -> bool {
+    world.imports.values().any(|item| match item {
+        WorldItem::Interface { id, .. } => TypeOwner::Interface(*id) == owner,
+        _ => false,
+    })
+}
+
+/// The resources declared in the interfaces `world` exports.
+///
+/// A resource whose interface is also imported exists twice, once implemented
+/// by the host and once by the guest. The guest's side gets an `exported-`
+/// prefix so the two Go types do not collide.
+pub fn exported_resources(resolve: &Resolve, world: &World) -> ExportedResources {
+    let mut exported = ExportedResources::new();
+    for item in world.exports.values() {
+        let WorldItem::Interface { id, .. } = item else {
+            continue;
+        };
+        for &type_id in resolve.interfaces[*id].types.values() {
+            let type_def = &resolve.types[type_id];
+            if !matches!(type_def.kind, TypeDefKind::Resource) {
+                continue;
+            }
+            let name = qualified_type_name(type_id, resolve);
+            let name = if world_imports_interface(world, type_def.owner) {
+                format!("exported-{name}")
+            } else {
+                name
+            };
+            exported.insert(type_id, name);
+        }
+    }
+    exported
+}
+
+/// The resource a handle refers to, with aliases such as `use iface.{res}`
+/// followed to the resource's declaration, and whether the handle owns it.
+pub fn handle_resource(handle: &Handle, resolve: &Resolve) -> (TypeId, bool) {
+    match handle {
+        Handle::Own(id) => (dealias(resolve, *id), true),
+        Handle::Borrow(id) => (dealias(resolve, *id), false),
+    }
+}
+
+/// Kebab-case name of the handle table field for `resource` in the generated
+/// per-instance table struct. The prefix keeps the two sides of a resource
+/// that is both imported and exported apart, and keeps a resource named for a
+/// Go keyword (`type`, `map`) a valid identifier.
+pub fn resource_table_field(resource: TypeId, resolve: &Resolve, exported: bool) -> String {
+    let name = qualified_type_name(resource, resolve);
+    if exported {
+        format!("exported-{name}")
+    } else {
+        format!("imported-{name}")
+    }
+}
+
+/// Kebab-case Go name for a WIT function.
+///
+/// A resource's functions carry their kind in the WIT name
+/// (`[method]counter.get`, `[static]counter.merge`, `[constructor]counter`).
+/// A method becomes a Go method on the resource, so it keeps only its own name
+/// (`get`). A static function and a constructor become Go methods beside the
+/// interface's free functions, so they keep the resource name
+/// (`counter-merge`, `new-counter`).
+pub fn function_go_name(func: &Function, resolve: &Resolve) -> String {
+    let item = || {
+        func.name
+            .split_once('.')
+            .map(|(_, item)| item)
+            .unwrap_or(&func.name)
+    };
+    let resource = |id: &TypeId| {
+        resolve.types[*id]
+            .name
+            .clone()
+            .expect("resource should have a name")
+    };
+    match &func.kind {
+        FunctionKind::Freestanding => func.name.clone(),
+        FunctionKind::Method(_) => item().to_string(),
+        FunctionKind::Static(id) => format!("{}-{}", resource(id), item()),
+        FunctionKind::Constructor(id) => format!("new-{}", resource(id)),
+        kind => todo!("TODO(#4): implement async function kind {kind:?}"),
+    }
+}
+
 /// Resolves a Wasm type to a Go type.
 pub fn resolve_wasm_type(typ: &WasmType) -> GoType {
     match typ {
@@ -114,6 +218,18 @@ pub fn resolve_wasm_type(typ: &WasmType) -> GoType {
 /// - The type is still unimplemented.
 /// - The type does not have a name when it is expected to have one (enums, records, type aliases).
 pub fn resolve_type(typ: &Type, resolve: &Resolve) -> GoType {
+    resolve_type_in(typ, resolve, &ExportedResources::new())
+}
+
+/// Like [`resolve_type`], for a function whose resources in `exported` are
+/// implemented by the guest.
+///
+/// A handle to a resource the host implements is the Go interface generated
+/// for that resource. A handle to a resource the guest implements is a pointer
+/// to the generated handle struct. `own<T>` and `borrow<T>` share one Go type.
+pub fn resolve_type_in(typ: &Type, resolve: &Resolve, exported: &ExportedResources) -> GoType {
+    let nested =
+        |typ: &Type, position: &str| resolve_nested_type_in(typ, resolve, exported, position);
     match typ {
         // Basic types.
         Type::Bool => GoType::Bool,
@@ -139,8 +255,16 @@ pub fn resolve_type(typ: &Type, resolve: &Resolve) -> GoType {
                 .expect("failed to find type definition");
             match kind {
                 TypeDefKind::Record(_) => GoType::UserDefined(qualified_type_name(*id, resolve)),
-                TypeDefKind::Resource => todo!("TODO(#5): implement resources"),
-                TypeDefKind::Handle(_) => todo!("TODO(#5): implement resources"),
+                TypeDefKind::Resource => {
+                    panic!("a resource is only usable through an own or borrow handle")
+                }
+                TypeDefKind::Handle(handle) => {
+                    let (resource, _) = handle_resource(handle, resolve);
+                    match exported.get(&resource) {
+                        Some(name) => GoType::Pointer(Box::new(GoType::UserDefined(name.clone()))),
+                        None => GoType::UserDefined(qualified_type_name(resource, resolve)),
+                    }
+                }
                 TypeDefKind::Flags(_) => todo!("TODO(#4): implement flag conversion"),
                 TypeDefKind::Tuple(_) => todo!("TODO(#4): implement tuple conversion"),
                 TypeDefKind::Variant(_) => GoType::UserDefined(qualified_type_name(*id, resolve)),
@@ -149,21 +273,15 @@ pub fn resolve_type(typ: &Type, resolve: &Resolve) -> GoType {
                 // single pointer composes in every position (param, return,
                 // record field, list element); the prior `(T, bool)`
                 // comma-ok shape didn't.
-                TypeDefKind::Option(value) => GoType::Pointer(Box::new(resolve_nested_type(
-                    value,
-                    resolve,
-                    "an option payload",
-                ))),
+                TypeDefKind::Option(value) => {
+                    GoType::Pointer(Box::new(nested(value, "an option payload")))
+                }
 
                 // Various results, including specialised ones.
                 TypeDefKind::Result(Result_ {
                     ok: Some(ok),
                     err: Some(Type::String),
-                }) => GoType::ValueOrError(Box::new(resolve_nested_type(
-                    ok,
-                    resolve,
-                    "a result's ok type",
-                ))),
+                }) => GoType::ValueOrError(Box::new(nested(ok, "a result's ok type"))),
                 TypeDefKind::Result(Result_ {
                     ok: Some(_),
                     err: Some(_),
@@ -173,7 +291,7 @@ pub fn resolve_type(typ: &Type, resolve: &Resolve) -> GoType {
                 TypeDefKind::Result(Result_ {
                     ok: Some(ok),
                     err: None,
-                }) => resolve_nested_type(ok, resolve, "a result's ok type"),
+                }) => nested(ok, "a result's ok type"),
                 TypeDefKind::Result(Result_ {
                     ok: None,
                     err: Some(Type::String),
@@ -187,11 +305,9 @@ pub fn resolve_type(typ: &Type, resolve: &Resolve) -> GoType {
                     err: None,
                 }) => GoType::Nothing,
 
-                TypeDefKind::List(inner) => GoType::Slice(Box::new(resolve_nested_type(
-                    inner,
-                    resolve,
-                    "a list element",
-                ))),
+                TypeDefKind::List(inner) => {
+                    GoType::Slice(Box::new(nested(inner, "a list element")))
+                }
                 TypeDefKind::Future(_) => todo!("TODO(#4): implement future conversion"),
                 TypeDefKind::Stream(_) => todo!("TODO(#4): implement stream conversion"),
                 TypeDefKind::Type(_) => GoType::UserDefined(qualified_type_name(*id, resolve)),
@@ -213,6 +329,17 @@ pub fn resolve_type(typ: &Type, resolve: &Resolve) -> GoType {
 /// nested `result` is refused here rather than written out as Go that does not
 /// compile.
 pub fn resolve_nested_type(typ: &Type, resolve: &Resolve, position: &str) -> GoType {
+    resolve_nested_type_in(typ, resolve, &ExportedResources::new(), position)
+}
+
+/// Like [`resolve_nested_type`], with the resources in `exported` implemented
+/// by the guest.
+pub fn resolve_nested_type_in(
+    typ: &Type,
+    resolve: &Resolve,
+    exported: &ExportedResources,
+    position: &str,
+) -> GoType {
     if let Type::Id(id) = typ
         && matches!(
             resolve.types[dealias(resolve, *id)].kind,
@@ -221,7 +348,7 @@ pub fn resolve_nested_type(typ: &Type, resolve: &Resolve, position: &str) -> GoT
     {
         todo!("TODO(#4): implement a nested result in {position}");
     }
-    resolve_type(typ, resolve)
+    resolve_type_in(typ, resolve, exported)
 }
 
 /// Like [`resolve_type`], but downgrades a top-level Variant to
@@ -235,11 +362,21 @@ pub fn resolve_nested_type(typ: &Type, resolve: &Resolve, position: &str) -> GoT
 /// Variants nested inside records, lists, or returns stay typed so
 /// generated record fields remain strongly typed.
 pub fn resolve_param_type(typ: &Type, resolve: &Resolve) -> GoType {
+    resolve_param_type_in(typ, resolve, &ExportedResources::new())
+}
+
+/// Like [`resolve_param_type`], with the resources in `exported` implemented
+/// by the guest.
+pub fn resolve_param_type_in(
+    typ: &Type,
+    resolve: &Resolve,
+    exported: &ExportedResources,
+) -> GoType {
     if let Type::Id(id) = typ {
         let def = &resolve.types[dealias(resolve, *id)];
         if matches!(def.kind, TypeDefKind::Variant(_)) {
             return GoType::Interface;
         }
     }
-    resolve_type(typ, resolve)
+    resolve_type_in(typ, resolve, exported)
 }

@@ -12,6 +12,11 @@ pub struct AnalyzedImports {
     /// All standalone functions found in the input world.
     pub standalone_functions: Vec<AnalyzedFunction>,
 
+    /// The handle tables for the world's resources. `None` when the world
+    /// declares no resource, so worlds without resources generate the same
+    /// code as before resources were supported.
+    pub resources: Option<AnalyzedResources>,
+
     /// The name of the factory type to be generated.
     pub factory_name: GoIdentifier,
     /// The name of the instance type to be generated.
@@ -40,8 +45,12 @@ pub struct AnalyzedImports {
 pub struct AnalyzedInterface {
     /// The name of the interface.
     pub name: String,
+    /// Every function of the interface, including the constructors, methods
+    /// and static functions of its resources.
     pub methods: Vec<InterfaceMethod>,
     pub types: Vec<AnalyzedType>,
+    /// The resources the interface declares.
+    pub resources: Vec<AnalyzedResource>,
 
     /// The Go interface type name (e.g., "ITestWorldLogger")
     ///
@@ -58,6 +67,60 @@ pub struct AnalyzedInterface {
     pub wazero_module_name: String,
 }
 
+/// A resource declared in an imported interface, which the host implements.
+///
+/// ```wit
+/// resource counter {
+///     constructor(start: u32);
+///     get: func() -> u32;
+/// }
+/// ```
+///
+/// The resource becomes a Go interface with one method per WIT method. Its
+/// constructor and static functions become methods of the Go interface
+/// generated for the WIT interface that declares it.
+#[derive(Debug, Clone)]
+pub struct AnalyzedResource {
+    /// The name of the resource in WIT.
+    pub name: String,
+    /// The Go interface type the host implements, e.g. `Counter`.
+    pub go_type_name: GoIdentifier,
+    /// The field holding this resource's handle table in the per-instance
+    /// table struct.
+    pub table_field: GoIdentifier,
+    /// The resource's methods, without constructors and static functions.
+    pub methods: Vec<InterfaceMethod>,
+}
+
+/// The handle tables of a world, kept once per module instance.
+#[derive(Debug, Clone)]
+pub struct AnalyzedResources {
+    /// The Go struct type holding one table per resource.
+    pub tables_name: GoIdentifier,
+    /// Resources the host implements: the table field and the Go interface
+    /// type its entries hold.
+    pub imported: Vec<(GoIdentifier, GoIdentifier)>,
+    /// Resources the guest implements: the table field. The entries are the
+    /// guest's `u32` representations.
+    pub exported: Vec<GoIdentifier>,
+    /// The host modules that give the guest its own resources' intrinsics.
+    pub guest_modules: Vec<GuestResourceModule>,
+}
+
+/// The `[export]<interface>` host module for one exported interface. A guest
+/// that implements a resource imports `[resource-new]`, `[resource-rep]` and
+/// `[resource-drop]` for it from this module.
+#[derive(Debug, Clone)]
+pub struct GuestResourceModule {
+    /// The module name, e.g. `[export]arcjet:resources/guest`.
+    pub wazero_module_name: String,
+    /// The name the interface's functions are exported under, e.g.
+    /// `arcjet:resources/guest`.
+    pub interface_name: String,
+    /// The WIT name and table field of each resource.
+    pub resources: Vec<(String, GoIdentifier)>,
+}
+
 /// Method signature for an interface
 #[derive(Debug, Clone)]
 pub struct InterfaceMethod {
@@ -67,7 +130,8 @@ pub struct InterfaceMethod {
     ///
     /// E.g. the `Log` in `func (l *Logger) Log(ctx context.Context, message string)`
     pub go_method_name: GoIdentifier,
-    /// The parameters of the interface method.
+    /// The parameters of the interface method. A resource method's `self`
+    /// is not included: it is the receiver of the Go method.
     pub parameters: Vec<Parameter>,
     /// The return type of the interface method.
     ///

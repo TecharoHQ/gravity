@@ -4,8 +4,8 @@ use genco::prelude::*;
 use wit_bindgen_core::{
     abi::{AbiVariant, LiftLower},
     wit_parser::{
-        Case, Function, InterfaceId, Param, Resolve, SizeAlign, Type, TypeDefKind, TypeId, World,
-        WorldItem,
+        Case, Function, FunctionKind, InterfaceId, Param, Resolve, SizeAlign, Type, TypeDefKind,
+        TypeId, World, WorldItem,
     },
 };
 
@@ -13,13 +13,14 @@ use crate::{
     codegen::{
         func::Func,
         ir::{
-            AnalyzedFunction, AnalyzedImports, AnalyzedInterface, AnalyzedType, CaseDispatch,
-            InterfaceMethod, Parameter, TypeDefinition, VariantCase, WitReturn,
+            AnalyzedFunction, AnalyzedImports, AnalyzedInterface, AnalyzedResource,
+            AnalyzedResources, AnalyzedType, CaseDispatch, GuestResourceModule, InterfaceMethod,
+            Parameter, TypeDefinition, VariantCase, WitReturn,
         },
     },
     go::{
         GoIdentifier, GoResult, GoType,
-        imports::{CONTEXT_CONTEXT, WAZERO_API_MODULE},
+        imports::{CONTEXT_CONTEXT, ERRORS_NEW, WAZERO_API_MODULE},
     },
     resolve_nested_type, resolve_param_type, resolve_type, resolve_wasm_type,
 };
@@ -47,6 +48,9 @@ impl<'a> ImportAnalyzer<'a> {
                     interfaces.push(self.analyze_interface(*id));
                 }
                 WorldItem::Type { id: type_id, .. } => {
+                    if matches!(self.resolve.types[*type_id].kind, TypeDefKind::Resource) {
+                        todo!("TODO(#5): implement a resource declared in the world itself");
+                    }
                     if let Some(t) = self.analyze_type(*type_id) {
                         standalone_types.push(t);
                     }
@@ -62,14 +66,66 @@ impl<'a> ImportAnalyzer<'a> {
         let instance_name = GoIdentifier::public(format!("{}-instance", self.world.name));
         let constructor_name = GoIdentifier::public(format!("new-{}-factory", self.world.name));
 
+        let resources = self.analyze_resources(&interfaces);
+
         AnalyzedImports {
             interfaces,
             standalone_types,
             standalone_functions,
+            resources,
             factory_name,
             instance_name,
             constructor_name,
         }
+    }
+
+    /// Collects the handle tables the world needs: one per resource of an
+    /// imported interface and one per resource of an exported interface.
+    fn analyze_resources(&self, interfaces: &[AnalyzedInterface]) -> Option<AnalyzedResources> {
+        let imported: Vec<_> = interfaces
+            .iter()
+            .flat_map(|interface| &interface.resources)
+            .map(|resource| (resource.table_field.clone(), resource.go_type_name.clone()))
+            .collect();
+
+        let mut exported = Vec::new();
+        let mut guest_modules = Vec::new();
+        for (key, item) in self.world.exports.iter() {
+            let WorldItem::Interface { id, .. } = item else {
+                continue;
+            };
+            let resources: Vec<_> = self.resolve.interfaces[*id]
+                .types
+                .iter()
+                .filter(|(_, type_id)| {
+                    matches!(self.resolve.types[**type_id].kind, TypeDefKind::Resource)
+                })
+                .map(|(name, type_id)| {
+                    let field = crate::resource_table_field(*type_id, self.resolve, true);
+                    (name.clone(), GoIdentifier::private(field))
+                })
+                .collect();
+            if resources.is_empty() {
+                continue;
+            }
+            exported.extend(resources.iter().map(|(_, field)| field.clone()));
+            let interface_name = self.resolve.name_world_key(key);
+            guest_modules.push(GuestResourceModule {
+                wazero_module_name: format!("[export]{interface_name}"),
+                interface_name,
+                resources,
+            });
+        }
+
+        if imported.is_empty() && exported.is_empty() {
+            return None;
+        }
+        Some(AnalyzedResources {
+            tables_name: GoIdentifier::private(format!("{}-resource-tables", self.world.name)),
+            imported,
+            exported,
+            guest_modules,
+        })
     }
 
     fn analyze_interface(&self, interface_id: InterfaceId) -> AnalyzedInterface {
@@ -77,7 +133,7 @@ impl<'a> ImportAnalyzer<'a> {
         let interface_name = interface.name.as_ref().expect("interface missing name");
 
         // Analyze methods
-        let methods = interface
+        let methods: Vec<_> = interface
             .functions
             .values()
             .map(|func| self.analyze_interface_method(func, interface_name))
@@ -88,6 +144,27 @@ impl<'a> ImportAnalyzer<'a> {
             .types
             .values()
             .filter_map(|&id| self.analyze_type(id))
+            .collect();
+
+        // Analyze the resources and attach each resource's methods to it
+        let resources = interface
+            .types
+            .iter()
+            .filter(|(_, id)| matches!(self.resolve.types[**id].kind, TypeDefKind::Resource))
+            .map(|(name, &id)| AnalyzedResource {
+                name: name.clone(),
+                go_type_name: GoIdentifier::public(crate::qualified_type_name(id, self.resolve)),
+                table_field: GoIdentifier::private(crate::resource_table_field(
+                    id,
+                    self.resolve,
+                    false,
+                )),
+                methods: methods
+                    .iter()
+                    .filter(|method| method.wit_function.kind == FunctionKind::Method(id))
+                    .cloned()
+                    .collect(),
+            })
             .collect();
 
         // Generate names
@@ -108,6 +185,7 @@ impl<'a> ImportAnalyzer<'a> {
             name: interface_name.clone(),
             methods,
             types,
+            resources,
             constructor_param_name: GoIdentifier::private(interface_name),
             go_interface_name,
             wazero_module_name,
@@ -115,9 +193,12 @@ impl<'a> ImportAnalyzer<'a> {
     }
 
     fn analyze_interface_method(&self, func: &Function, _interface_name: &str) -> InterfaceMethod {
+        // A method's `self` is the receiver of the Go method, not a parameter.
+        let skip_self = usize::from(matches!(func.kind, FunctionKind::Method(_)));
         let parameters = func
             .params
             .iter()
+            .skip(skip_self)
             .map(|Param { name, ty, .. }| Parameter {
                 name: GoIdentifier::private(name),
                 go_type: resolve_param_type(ty, self.resolve),
@@ -132,14 +213,14 @@ impl<'a> ImportAnalyzer<'a> {
 
         InterfaceMethod {
             name: func.name.clone(),
-            go_method_name: GoIdentifier::public(&func.name),
+            go_method_name: GoIdentifier::public(crate::function_go_name(func, self.resolve)),
             parameters,
             return_type,
             wit_function: func.clone(),
         }
     }
 
-    fn analyze_type(&self, type_id: TypeId) -> Option<AnalyzedType> {
+    pub(super) fn analyze_type(&self, type_id: TypeId) -> Option<AnalyzedType> {
         let type_def = &self.resolve.types[type_id];
         let qualified = crate::qualified_type_name(type_id, self.resolve);
         let go_type_name = GoIdentifier::public(&qualified);
@@ -238,8 +319,10 @@ impl<'a> ImportAnalyzer<'a> {
             TypeDefKind::Stream(_) => todo!("TODO(#4): generate stream type definition"),
             TypeDefKind::Flags(_) => todo!("TODO(#4):generate flags type definition"),
             TypeDefKind::Tuple(_) => todo!("TODO(#4):generate tuple type definition"),
-            TypeDefKind::Resource => todo!("TODO(#5): implement resources"),
-            TypeDefKind::Handle(_) => todo!("TODO(#5): implement resources"),
+            // A resource is not a data type: `analyze_interface` turns it
+            // into a Go interface and a handle table.
+            TypeDefKind::Resource => return None,
+            TypeDefKind::Handle(_) => todo!("TODO(#5): generate a named handle type"),
             TypeDefKind::Map(_, _) => todo!("TODO(#4): generate map type definition"),
             TypeDefKind::Unknown => panic!("cannot generate Unknown type"),
         })
@@ -306,6 +389,13 @@ impl<'a> ImportCodeGenerator<'a> {
                 };
             }
 
+            for resource in &interface.resources {
+                chain.push();
+                quote_in! { chain =>
+                    $(self.generate_resource_drop(resource))
+                };
+            }
+
             chain.push();
             quote_in! { chain =>
                 Instantiate(ctx)
@@ -315,6 +405,18 @@ impl<'a> ImportCodeGenerator<'a> {
             };
 
             chains.insert(interface.wazero_module_name.clone(), chain);
+        }
+
+        let guest_modules = self
+            .analyzed
+            .resources
+            .iter()
+            .flat_map(|resources| &resources.guest_modules);
+        for (i, module) in guest_modules.enumerate() {
+            chains.insert(
+                module.wazero_module_name.clone(),
+                self.generate_guest_resource_module(module, i),
+            );
         }
 
         chains
@@ -327,23 +429,31 @@ impl FormatInto<Go> for ImportCodeGenerator<'_> {
         for interface in &self.analyzed.interfaces {
             self.generate_interface_type(interface, tokens);
 
+            for resource in &interface.resources {
+                self.generate_resource_type(resource, tokens);
+            }
+
             for typ in &interface.types {
-                self.generate_type_definition(typ, tokens);
+                Self::generate_type_definition(typ, tokens);
             }
         }
 
         // Generate standalone types
         for typ in &self.analyzed.standalone_types {
-            self.generate_type_definition(typ, tokens);
+            Self::generate_type_definition(typ, tokens);
         }
     }
 }
 
 impl<'a> ImportCodeGenerator<'a> {
     fn generate_interface_type(&self, interface: &AnalyzedInterface, tokens: &mut Tokens<Go>) {
+        // A resource's methods belong to the resource's own Go interface.
+        // Its constructor and static functions have no receiver, so they
+        // stay here beside the free functions.
         let methods = interface
             .methods
             .iter()
+            .filter(|method| !matches!(method.wit_function.kind, FunctionKind::Method(_)))
             .map(|method| self.generate_method_signature(method));
 
         quote_in! { *tokens =>
@@ -352,6 +462,137 @@ impl<'a> ImportCodeGenerator<'a> {
                 $(for method in methods join ($['\r']) => $method)
             }
         }
+    }
+
+    /// Generates the Go interface the host implements for a resource.
+    fn generate_resource_type(&self, resource: &AnalyzedResource, tokens: &mut Tokens<Go>) {
+        let methods = resource
+            .methods
+            .iter()
+            .map(|method| self.generate_method_signature(method));
+        let name = &resource.go_type_name;
+        let doc = [
+            format!(
+                "{} is the `{}` resource, which the host implements.",
+                String::from(name),
+                resource.name
+            ),
+            "When the guest drops the last handle that owns a value, gravity calls the".to_string(),
+            "value's `ResourceDrop(ctx context.Context)` method if it has one.".to_string(),
+        ];
+
+        quote_in! { *tokens =>
+            $['\n']
+            $(crate::go::comment(&doc))
+            type $name interface {
+                $(for method in methods join ($['\r']) => $method)
+            }
+        }
+    }
+
+    /// Generates the `[resource-drop]` host function for a resource the host
+    /// implements. The guest calls it to give up a handle.
+    fn generate_resource_drop(&self, resource: &AnalyzedResource) -> Tokens<Go> {
+        let table = &resource.table_field;
+        let message = format!("invalid {} handle", resource.name);
+        quote! {
+            NewFunctionBuilder().
+            WithFunc(func(
+                ctx $CONTEXT_CONTEXT,
+                mod $WAZERO_API_MODULE,
+                handle uint32,
+            ) {
+                value, own, ok := resourcesOf(mod).$table.remove(handle)
+                if !ok {
+                    panic($ERRORS_NEW($(quoted(message))))
+                }
+                $(crate::go::comment(&[
+                    "A borrowed handle does not own the value, so dropping it leaves the",
+                    "value alone.",
+                ]))
+                if !own {
+                    return
+                }
+                if dropper, ok := any(value).(interface{ ResourceDrop(ctx $CONTEXT_CONTEXT) }); ok {
+                    dropper.ResourceDrop(ctx)
+                }
+            }).
+            Export($(quoted(format!("[resource-drop]{}", resource.name)))).
+        }
+    }
+
+    /// Generates the `[export]<interface>` host module, which holds the
+    /// canonical ABI built-ins for the resources the guest implements.
+    ///
+    /// The guest names each of its values with a `u32` of its choice, the
+    /// representation. `[resource-new]` wraps a representation in a handle,
+    /// `[resource-rep]` reads it back, and `[resource-drop]` gives up a handle
+    /// and runs the guest's destructor.
+    fn generate_guest_resource_module(
+        &self,
+        module: &GuestResourceModule,
+        index: usize,
+    ) -> Tokens<Go> {
+        let err = &GoIdentifier::private(format!("err-export{index}"));
+        let mut chain = quote! {
+            _, $err := wazeroRuntime.NewHostModuleBuilder($(quoted(&module.wazero_module_name))).
+        };
+
+        for (name, table) in &module.resources {
+            let message = format!("invalid {name} handle");
+            let dtor = format!("{}#[dtor]{name}", module.interface_name);
+            chain.push();
+            quote_in! { chain =>
+                NewFunctionBuilder().
+                WithFunc(func(
+                    ctx $CONTEXT_CONTEXT,
+                    mod $WAZERO_API_MODULE,
+                    rep uint32,
+                ) uint32 {
+                    return resourcesOf(mod).$table.add(rep, true)
+                }).
+                Export($(quoted(format!("[resource-new]{name}")))).
+                NewFunctionBuilder().
+                WithFunc(func(
+                    ctx $CONTEXT_CONTEXT,
+                    mod $WAZERO_API_MODULE,
+                    handle uint32,
+                ) uint32 {
+                    rep, ok := resourcesOf(mod).$table.get(handle)
+                    if !ok {
+                        panic($ERRORS_NEW($(quoted(&message))))
+                    }
+                    return rep
+                }).
+                Export($(quoted(format!("[resource-rep]{name}")))).
+                NewFunctionBuilder().
+                WithFunc(func(
+                    ctx $CONTEXT_CONTEXT,
+                    mod $WAZERO_API_MODULE,
+                    handle uint32,
+                ) {
+                    rep, _, ok := resourcesOf(mod).$table.remove(handle)
+                    if !ok {
+                        panic($ERRORS_NEW($(quoted(&message))))
+                    }
+                    if dtor := mod.ExportedFunction($(quoted(&dtor))); dtor != nil {
+                        if _, err := dtor.Call(ctx, uint64(rep)); err != nil {
+                            panic(err)
+                        }
+                    }
+                }).
+                Export($(quoted(format!("[resource-drop]{name}")))).
+            };
+        }
+
+        chain.push();
+        quote_in! { chain =>
+            Instantiate(ctx)
+            if $err != nil {
+                return nil, $err
+            }
+        };
+        chain
     }
 
     fn generate_method_signature(&self, method: &InterfaceMethod) -> Tokens<Go> {
@@ -369,7 +610,7 @@ impl<'a> ImportCodeGenerator<'a> {
         }
     }
 
-    fn generate_type_definition(&self, typ: &AnalyzedType, tokens: &mut Tokens<Go>) {
+    pub(super) fn generate_type_definition(typ: &AnalyzedType, tokens: &mut Tokens<Go>) {
         match &typ.definition {
             TypeDefinition::Record { fields } => {
                 quote_in! { *tokens =>
@@ -535,6 +776,7 @@ mod tests {
             interfaces: vec![],
             standalone_functions: vec![],
             standalone_types: vec![],
+            resources: None,
             factory_name: GoIdentifier::public("TestFactory"),
             constructor_name: GoIdentifier::public("NewTestFactory"),
         }
@@ -550,6 +792,89 @@ mod tests {
             .generate_host_function_builder(method, &param_name)
             .to_string()
             .unwrap()
+    }
+
+    /// A resource the host implements becomes a Go interface. Its methods
+    /// are called on the value behind the handle, its constructor and static
+    /// functions on the interface's implementation, and the guest gives up a
+    /// handle through `[resource-drop]`.
+    #[test]
+    fn test_imported_resource() {
+        let fixture = host_fixture(
+            "resource thing {
+                constructor(n: u32);
+                get: func() -> u32;
+                join: static func(a: thing, b: borrow<thing>) -> thing;
+            }
+            peek: func(t: borrow<thing>) -> u32;",
+        );
+        let analyzed = ImportAnalyzer::new(&fixture.resolve, fixture.world()).analyze();
+        let generator = ImportCodeGenerator::new(&fixture.resolve, &analyzed, &fixture.sizes);
+        let chains = generator.import_chains();
+        let chain = chains["test:fixture/host"].to_string().unwrap();
+        let mut tokens = Tokens::<Go>::new();
+        generator.format_into(&mut tokens);
+        let types = tokens.to_string().unwrap();
+        println!("Types:\n{types}\nChain:\n{chain}");
+
+        // The methods live on the resource, everything else on the interface.
+        let (interface, resource) = types
+            .split_once("type Thing interface {")
+            .expect("resource interface should be generated");
+        assert!(interface.contains("type ITestWorldHost interface {"));
+        assert!(interface.contains("NewThing("));
+        assert!(interface.contains("ThingJoin("));
+        assert!(interface.contains("Peek("));
+        assert!(!interface.contains("Get("));
+        assert!(resource.contains("Get("));
+
+        assert!(chain.contains("value1 := host.NewThing(ctx, result0)"));
+        assert!(chain.contains("resourcesOf(mod).importedThing.add(value1, true)"));
+        assert!(chain.contains("Export(\"[constructor]thing\")"));
+        // `self` is a borrow: looked up, not removed, and the receiver.
+        assert!(
+            chain.contains("resource0, ok0 := resourcesOf(mod).importedThing.get(uint32(arg0))")
+        );
+        assert!(chain.contains(":= resource0.Get(ctx, )"));
+        // An owned argument leaves the guest's table.
+        assert!(chain.contains("resourcesOf(mod).importedThing.take(uint32(arg0))"));
+        assert!(chain.contains("host.ThingJoin(ctx, "));
+        assert!(chain.contains("Export(\"[resource-drop]thing\")"));
+        assert!(chain.contains("dropper.ResourceDrop(ctx)"));
+
+        let resources = analyzed
+            .resources
+            .expect("world should have resource tables");
+        assert_eq!(resources.imported.len(), 1);
+        assert!(resources.exported.is_empty());
+    }
+
+    /// The guest reaches the built-ins for a resource it implements through
+    /// the `[export]<interface>` module.
+    #[test]
+    fn test_guest_resource_module() {
+        let fixture = Fixture::parse(
+            "package test:fixture;
+            interface things {
+                resource thing {
+                    constructor();
+                }
+            }
+            world test-world {
+                export things;
+            }",
+        );
+        let analyzed = ImportAnalyzer::new(&fixture.resolve, fixture.world()).analyze();
+        let generator = ImportCodeGenerator::new(&fixture.resolve, &analyzed, &fixture.sizes);
+        let chains = generator.import_chains();
+        let chain = chains["[export]test:fixture/things"].to_string().unwrap();
+        println!("Chain:\n{chain}");
+
+        assert!(chain.contains("NewHostModuleBuilder(\"[export]test:fixture/things\")"));
+        assert!(chain.contains("Export(\"[resource-new]thing\")"));
+        assert!(chain.contains("Export(\"[resource-rep]thing\")"));
+        assert!(chain.contains("Export(\"[resource-drop]thing\")"));
+        assert!(chain.contains("ExportedFunction(\"test:fixture/things#[dtor]thing\")"));
     }
 
     #[test]

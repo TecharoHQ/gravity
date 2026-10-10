@@ -3,10 +3,13 @@ use std::mem;
 use genco::prelude::*;
 use wit_bindgen_core::{
     abi::{Bindgen, Instruction},
-    wit_parser::{Alignment, ArchitectureSize, Resolve, Result_, SizeAlign, Type},
+    wit_parser::{
+        Alignment, ArchitectureSize, FunctionKind, Resolve, Result_, SizeAlign, Type, TypeId,
+    },
 };
 
 use crate::{
+    ExportedResources,
     go::{
         GoIdentifier, GoResult, GoType, Operand, comment,
         imports::{
@@ -14,7 +17,7 @@ use crate::{
             WAZERO_API_ENCODE_F32, WAZERO_API_ENCODE_F64,
         },
     },
-    resolve_type, resolve_wasm_type,
+    resolve_type_in, resolve_wasm_type,
 };
 
 /// The direction of a function.
@@ -42,6 +45,11 @@ pub struct Func<'a> {
     block_storage: Vec<Tokens<Go>>,
     blocks: Vec<(Tokens<Go>, Vec<Operand>)>,
     sizes: &'a SizeAlign,
+    /// The resources this function sees as implemented by the guest.
+    exported: ExportedResources,
+    /// The name the guest exports the function under, when it differs from
+    /// the WIT function name (`arcjet:resources/guest#make` for `make`).
+    export_name: Option<String>,
 }
 
 impl<'a> Func<'a> {
@@ -57,6 +65,8 @@ impl<'a> Func<'a> {
             block_storage: Vec::new(),
             blocks: Vec::new(),
             sizes,
+            exported: ExportedResources::new(),
+            export_name: None,
         }
     }
 
@@ -71,7 +81,66 @@ impl<'a> Func<'a> {
             block_storage: Vec::new(),
             blocks: Vec::new(),
             sizes,
+            exported: ExportedResources::new(),
+            export_name: None,
         }
+    }
+
+    /// Sets the resources the guest implements. Only functions of an exported
+    /// interface see any.
+    pub fn with_exported_resources(mut self, exported: ExportedResources) -> Self {
+        self.exported = exported;
+        self
+    }
+
+    /// Sets the name the guest exports this function under.
+    pub fn with_export_name(mut self, name: String) -> Self {
+        self.export_name = Some(name);
+        self
+    }
+
+    /// The Go expression for the handle table of `resource` in the current
+    /// direction. An export reads the tables of its own instance. A host
+    /// function is shared by every instance, so it finds the tables of the
+    /// module that called it.
+    fn resource_table(&self, resource: TypeId, resolve: &Resolve) -> String {
+        let field =
+            crate::resource_table_field(resource, resolve, self.exported.contains_key(&resource));
+        let field = String::from(GoIdentifier::private(field));
+        match self.direction {
+            Direction::Export => format!("i.resources.{field}"),
+            Direction::Import { .. } => format!("resourcesOf(mod).{field}"),
+        }
+    }
+
+    /// Emits `if <condition> { ... }` that fails the function with `message`
+    /// the way its return type allows: an error return when there is one, a
+    /// panic otherwise.
+    fn fail_if(&mut self, condition: &str, message: &str) {
+        let tmp = self.tmp();
+        let default = &format!("default{tmp}");
+        quote_in! { self.body =>
+            $['\r']
+            $(match &self.result {
+                GoResult::Anon(GoType::ValueOrError(typ)) => {
+                    if $condition {
+                        var $default $(typ.as_ref())
+                        return $default, $ERRORS_NEW($(quoted(message)))
+                    }
+                }
+                GoResult::Anon(GoType::Error) => {
+                    if $condition {
+                        return $ERRORS_NEW($(quoted(message)))
+                    }
+                }
+                GoResult::Anon(_) | GoResult::Empty => {
+                    $(comment(&["The return type doesn't contain an error so we panic if one is encountered"]))
+                    if $condition {
+                        panic($ERRORS_NEW($(quoted(message))))
+                    }
+                }
+            })
+        };
     }
 
     fn tmp(&mut self) -> usize {
@@ -231,6 +300,7 @@ impl Bindgen for Func<'_> {
                 results.push(Operand::SingleValue(len.into()));
             }
             Instruction::CallWasm { name, .. } => {
+                let name = &self.export_name.clone().unwrap_or(name.to_string());
                 let tmp = self.tmp();
                 let raw = &format!("raw{tmp}");
                 let ret = &format!("results{tmp}");
@@ -242,27 +312,27 @@ impl Bindgen for Func<'_> {
                     $['\r']
                     $(match &self.result {
                         GoResult::Anon(GoType::ValueOrError(typ)) => {
-                            $raw, $err := $module_handle.ExportedFunction($(quoted(*name))).Call(ctx, $(for op in operands.iter() join (, ) => uint64($op)))
+                            $raw, $err := $module_handle.ExportedFunction($(quoted(name))).Call(ctx, $(for op in operands.iter() join (, ) => uint64($op)))
                             if $err != nil {
                                 var $default $(typ.as_ref())
                                 return $default, $err
                             }
                         }
                         GoResult::Anon(GoType::Error) => {
-                            $raw, $err := $module_handle.ExportedFunction($(quoted(*name))).Call(ctx, $(for op in operands.iter() join (, ) => uint64($op)))
+                            $raw, $err := $module_handle.ExportedFunction($(quoted(name))).Call(ctx, $(for op in operands.iter() join (, ) => uint64($op)))
                             if $err != nil {
                                 return $err
                             }
                         }
                         GoResult::Anon(_) => {
-                            $raw, $err := $module_handle.ExportedFunction($(quoted(*name))).Call(ctx, $(for op in operands.iter() join (, ) => uint64($op)))
+                            $raw, $err := $module_handle.ExportedFunction($(quoted(name))).Call(ctx, $(for op in operands.iter() join (, ) => uint64($op)))
                             $(comment(&["The return type doesn't contain an error so we panic if one is encountered"]))
                             if $err != nil {
                                 panic($err)
                             }
                         }
                         GoResult::Empty => {
-                            _, $err := $module_handle.ExportedFunction($(quoted(*name))).Call(ctx, $(for op in operands.iter() join (, ) => uint64($op)))
+                            _, $err := $module_handle.ExportedFunction($(quoted(name))).Call(ctx, $(for op in operands.iter() join (, ) => uint64($op)))
                             $(comment(&["The return type doesn't contain an error so we panic if one is encountered"]))
                             if $err != nil {
                                 panic($err)
@@ -552,7 +622,7 @@ impl Bindgen for Func<'_> {
                 let tmp = self.tmp();
                 let value = &format!("value{tmp}");
                 let err = &format!("err{tmp}");
-                let typ = resolve_type(typ, resolve);
+                let typ = resolve_type_in(typ, resolve, &self.exported);
                 let tag = &operands[0];
                 quote_in! { self.body =>
                     $['\r']
@@ -617,12 +687,20 @@ impl Bindgen for Func<'_> {
                 }
             }
             Instruction::CallInterface { func, .. } => {
-                let ident = GoIdentifier::public(&func.name);
+                let ident = GoIdentifier::public(crate::function_go_name(func, resolve));
                 let tmp = self.tmp();
+                // A resource method is called on the lifted `self`, the Go
+                // value the host stored for the handle. Every other function,
+                // including a resource's constructor and static functions, is
+                // called on the host's implementation of the interface.
+                let (receiver, operands) = match func.kind {
+                    FunctionKind::Method(_) => (Some(operands[0].as_string()), &operands[1..]),
+                    _ => (None, &operands[..]),
+                };
                 let args = quote!($(for op in operands.iter() join (, ) => $op));
                 let returns = match &func.result {
                     None => GoType::Nothing,
-                    Some(typ) => resolve_type(typ, resolve),
+                    Some(typ) => resolve_type_in(typ, resolve, &self.exported),
                 };
                 let value = &format!("value{tmp}");
                 let err = &format!("err{tmp}");
@@ -635,6 +713,7 @@ impl Bindgen for Func<'_> {
                 match self.direction {
                     Direction::Export { .. } => todo!("TODO(#10): handle export direction"),
                     Direction::Import { param_name, .. } => {
+                        let param_name = &receiver.unwrap_or(String::from(param_name));
                         quote_in! { self.body =>
                             $['\r']
                             $(match returns {
@@ -775,7 +854,7 @@ impl Bindgen for Func<'_> {
 
                 let tmp = self.tmp();
                 let result = &format!("result{tmp}");
-                let inner_typ = resolve_type(payload, resolve);
+                let inner_typ = resolve_type_in(payload, resolve, &self.exported);
                 let op = &operands[0];
 
                 quote_in! { self.body =>
@@ -934,7 +1013,7 @@ impl Bindgen for Func<'_> {
                 let len_operand = &operands[1];
                 let body_result = &body_results[0];
 
-                let typ = resolve_type(element, resolve);
+                let typ = resolve_type_in(element, resolve, &self.exported);
 
                 quote_in! { self.body =>
                     $['\r']
@@ -1577,8 +1656,71 @@ impl Bindgen for Func<'_> {
 
                 results.push(Operand::SingleValue(ptr.into()));
             }
-            Instruction::HandleLower { .. } | Instruction::HandleLift { .. } => {
-                todo!("implement resources: {inst:?}")
+            // Hands a resource to the guest as a `u32`.
+            Instruction::HandleLower { handle, .. } => {
+                let (resource, owned) = crate::handle_resource(handle, resolve);
+                let table = &self.resource_table(resource, resolve);
+                let tmp = self.tmp();
+                let result = &format!("handle{tmp}");
+                let operand = &operands[0];
+                if self.exported.contains_key(&resource) {
+                    // The guest implements the resource. It receives a
+                    // borrow as the representation itself, with no handle in
+                    // between, and an owned value as a new handle, after
+                    // which the Go handle is spent.
+                    if owned {
+                        quote_in! { self.body =>
+                            $['\r']
+                            $result := $table.add($operand.give(i), true)
+                        };
+                    } else {
+                        quote_in! { self.body =>
+                            $['\r']
+                            $result := $operand.lend(i)
+                        };
+                    }
+                } else {
+                    // The host implements the resource. The guest receives a
+                    // handle to the Go value: an owning one, or a borrowed
+                    // one that it drops before it returns.
+                    let own = if owned { "true" } else { "false" };
+                    quote_in! { self.body =>
+                        $['\r']
+                        $result := $table.add($operand, $own)
+                    };
+                }
+                results.push(Operand::SingleValue(result.into()));
+            }
+            // Reads a resource the guest passed as a `u32` handle.
+            Instruction::HandleLift { handle, name, .. } => {
+                let (resource, owned) = crate::handle_resource(handle, resolve);
+                let table = &self.resource_table(resource, resolve);
+                let tmp = self.tmp();
+                let value = &format!("resource{tmp}");
+                let ok = &format!("ok{tmp}");
+                let operand = &operands[0];
+                // An owned handle leaves the guest's table: the value now
+                // belongs to the host. A borrowed handle stays.
+                let lookup = if owned { "take" } else { "get" };
+                quote_in! { self.body =>
+                    $['\r']
+                    $value, $ok := $table.$lookup(uint32($operand))
+                };
+                self.fail_if(&format!("!{ok}"), &format!("invalid {name} handle"));
+                match self.exported.get(&resource) {
+                    Some(go_name) => {
+                        // The table held the guest's representation; wrap it
+                        // in the Go handle type.
+                        let go_name = &GoIdentifier::public(go_name);
+                        let wrapped = &format!("wrapped{tmp}");
+                        quote_in! { self.body =>
+                            $['\r']
+                            $wrapped := &$go_name{instance: i, rep: $value}
+                        };
+                        results.push(Operand::SingleValue(wrapped.into()));
+                    }
+                    None => results.push(Operand::SingleValue(value.into())),
+                }
             }
             Instruction::ListCanonLower { .. } | Instruction::ListCanonLift { .. } => {
                 unimplemented!("gravity doesn't represent lists as Canonical")

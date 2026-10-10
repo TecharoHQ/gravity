@@ -1,0 +1,56 @@
+package arcjet:resources;
+
+/// Resources the host implements and the guest uses.
+interface host {
+  resource counter {
+    constructor(start: u32);
+    increment: func();
+    get: func() -> u32;
+    name: func() -> string;
+    /// Takes `a` by value and `b` by reference, returns a new counter.
+    merge: static func(a: counter, b: borrow<counter>) -> counter;
+  }
+
+  describe: func(c: borrow<counter>) -> string;
+  make-counter: func(start: u32) -> counter;
+  consume: func(c: counter) -> u32;
+}
+
+/// Resources the guest implements and the host uses.
+interface guest {
+  resource accumulator {
+    constructor(label: string);
+    add: func(n: u32);
+    total: func() -> u32;
+    label: func() -> string;
+    combine: static func(a: accumulator, b: borrow<accumulator>) -> accumulator;
+  }
+
+  sum: func(a: borrow<accumulator>) -> u32;
+  finish: func(a: accumulator) -> u32;
+  make: func(label: string, n: u32) -> accumulator;
+  try-make: func(label: string) -> result<accumulator, string>;
+  /// The number of accumulators the guest has not dropped yet.
+  live: func() -> u32;
+}
+
+world resources {
+  import host;
+  export guest;
+
+  use host.{counter};
+
+  /// Increments a counter the host owns and returns its new value.
+  export bump: func(c: borrow<counter>) -> u32;
+  /// Takes ownership of a counter and drops it.
+  export take: func(c: counter) -> u32;
+  /// Takes ownership of a counter and hands it back.
+  export roundtrip: func(c: counter) -> counter;
+  /// Constructs a counter in the host and returns it.
+  export fresh: func(start: u32) -> counter;
+  /// Exercises every host import.
+  export exercise: func(start: u32) -> string;
+  export maybe: func(start: u32, some: bool) -> option<counter>;
+  /// Constructs `n` counters in the host, starting at 0, 1, 2, ...
+  export batch: func(n: u32) -> list<counter>;
+}
