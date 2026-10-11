@@ -3,7 +3,7 @@ pub mod go;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::go::GoType;
+use crate::go::{GoIdentifier, GoType};
 use wit_bindgen_core::{
     abi::WasmType,
     dealias,
@@ -293,6 +293,15 @@ pub fn resource_table_field(resource: TypeId, resolve: &Resolve, exported: bool)
 /// interface's free functions, so they keep the resource name
 /// (`counter-merge`, `new-counter`).
 pub fn function_go_name(func: &Function, resolve: &Resolve) -> String {
+    function_go_name_in(func, resolve, &ExportedResources::new())
+}
+
+/// Name a function using the resource types for its side of the world.
+pub fn function_go_name_in(
+    func: &Function,
+    resolve: &Resolve,
+    exported: &ExportedResources,
+) -> String {
     let item = || {
         func.name
             .split_once('.')
@@ -300,10 +309,12 @@ pub fn function_go_name(func: &Function, resolve: &Resolve) -> String {
             .unwrap_or(&func.name)
     };
     let resource = |id: &TypeId| {
-        resolve.types[*id]
-            .name
-            .clone()
-            .expect("resource should have a name")
+        exported.resources.get(id).cloned().unwrap_or_else(|| {
+            resolve.types[*id]
+                .name
+                .clone()
+                .expect("resource should have a name")
+        })
     };
     match &func.kind {
         FunctionKind::Freestanding => func.name.clone(),
@@ -312,6 +323,24 @@ pub fn function_go_name(func: &Function, resolve: &Resolve) -> String {
         FunctionKind::Constructor(id) => format!("new-{}", resource(id)),
         kind => todo!("TODO(#4): implement async function kind {kind:?}"),
     }
+}
+
+/// Name of a core Wasm export, qualified only for interface functions.
+pub fn core_export_name(interface: Option<&str>, name: &str) -> String {
+    match interface {
+        Some(interface) => format!("{interface}#{name}"),
+        None => name.to_string(),
+    }
+}
+
+/// Core Wasm export for a guest resource destructor.
+pub fn core_resource_dtor_name(interface: &str, resource: &str) -> String {
+    core_export_name(Some(interface), &format!("[dtor]{resource}"))
+}
+
+/// Go helper that wraps a guest representation in its owning handle.
+pub fn resource_adopt_name(resource: &GoIdentifier) -> GoIdentifier {
+    GoIdentifier::private(format!("adopt-{}", String::from(resource)))
 }
 
 /// Resolves a Wasm type to a Go type.

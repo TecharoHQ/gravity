@@ -9,6 +9,7 @@ interface types-a {
     constructor(x: u32);
     get-x: func() -> u32;
     set-x: func(n: u32);
+    drop: func() -> u32;
   }
 
   resource bar {
@@ -23,6 +24,9 @@ interface types-a {
     label: string,
     foo: foo,
   }
+
+  close: func() -> u32;
+  make: func() -> u32;
 
   label-foo: func(label: string, x: u32) -> labeled;
   double-foo-x: func(f: borrow<foo>) -> u32;
@@ -51,6 +55,10 @@ world resources-shared {
   import types-b;
   export types-a;
   export types-b;
+  export close: func() -> u32;
+  export make: func() -> u32;
+  export types-a-make: func() -> u32;
+  export util: interface { make: func() -> u32; }
 
   /// Uses the host's side of both interfaces.
   export use-host: func(x: u32, y: string) -> string;

@@ -25,6 +25,12 @@ type IResourcesSharedTypesA interface {
 		ctx context.Context,
 		value string,
 	) Bar
+	Close(
+		ctx context.Context,
+	) uint32
+	Make(
+		ctx context.Context,
+	) uint32
 	LabelFoo(
 		ctx context.Context,
 		label string,
@@ -51,6 +57,9 @@ type TypesAFoo interface {
 		ctx context.Context,
 		n uint32,
 	)
+	Drop(
+		ctx context.Context,
+	) uint32
 }
 
 // Bar is the `bar` resource, which the host implements.
@@ -356,6 +365,22 @@ func NewResourcesSharedFactory(
 		ctx context.Context,
 		mod api.Module,
 		arg0 uint32,
+	) uint32{
+		resource0, ok0 := resourcesOf(mod).importedTypesAFoo.get(uint32(arg0))
+		// The return type doesn't contain an error so we panic if one is encountered
+		if !ok0 {
+			panic(errors.New("invalid foo handle"))
+		}
+		value2 := resource0.Drop(ctx, )
+		result3 := uint32(value2)
+		return result3
+	}).
+	Export("[method]foo.drop").
+	NewFunctionBuilder().
+	WithFunc(func(
+		ctx context.Context,
+		mod api.Module,
+		arg0 uint32,
 		arg1 uint32,
 	) uint32{
 		buf0, ok0 := mod.Memory().Read(arg0, arg1)
@@ -412,6 +437,26 @@ func NewResourcesSharedFactory(
 		resource0.Append(ctx, str2)
 	}).
 	Export("[method]bar.append").
+	NewFunctionBuilder().
+	WithFunc(func(
+		ctx context.Context,
+		mod api.Module,
+	) uint32{
+		value0 := typesA.Close(ctx, )
+		result1 := uint32(value0)
+		return result1
+	}).
+	Export("close").
+	NewFunctionBuilder().
+	WithFunc(func(
+		ctx context.Context,
+		mod api.Module,
+	) uint32{
+		value0 := typesA.Make(ctx, )
+		result1 := uint32(value0)
+		return result1
+	}).
+	Export("make").
 	NewFunctionBuilder().
 	WithFunc(func(
 		ctx context.Context,
@@ -948,6 +993,51 @@ func writeString(
 	return uint64(ptr), uint64(len(s)), nil
 }
 
+func (i *ResourcesSharedInstance) ResourcesSharedClose(
+	ctx context.Context,
+) uint32 {
+	i.dropCollected(ctx)
+	raw0, err0 := i.module.ExportedFunction("close").Call(ctx, )
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err0 != nil {
+		panic(err0)
+	}
+
+	results0 := raw0[0]
+	result1 := uint32(results0)
+	return result1
+}
+
+func (i *ResourcesSharedInstance) ResourcesSharedMake(
+	ctx context.Context,
+) uint32 {
+	i.dropCollected(ctx)
+	raw0, err0 := i.module.ExportedFunction("make").Call(ctx, )
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err0 != nil {
+		panic(err0)
+	}
+
+	results0 := raw0[0]
+	result1 := uint32(results0)
+	return result1
+}
+
+func (i *ResourcesSharedInstance) TypesAMake(
+	ctx context.Context,
+) uint32 {
+	i.dropCollected(ctx)
+	raw0, err0 := i.module.ExportedFunction("types-a-make").Call(ctx, )
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err0 != nil {
+		panic(err0)
+	}
+
+	results0 := raw0[0]
+	result1 := uint32(results0)
+	return result1
+}
+
 func (i *ResourcesSharedInstance) UseHost(
 	ctx context.Context,
 	x uint32,
@@ -1197,6 +1287,24 @@ func (self *ExportedTypesAFoo) SetX(
 	}
 }
 
+func (self *ExportedTypesAFoo) ExportedTypesAFooDrop(
+	ctx context.Context,
+) uint32 {
+	i := self.instance
+	i.dropCollected(ctx)
+	arg0 := self
+	handle0 := arg0.lend(i)
+	raw1, err1 := i.module.ExportedFunction("arcjet:resources-shared/types-a#[method]foo.drop").Call(ctx, uint64(handle0))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err1 != nil {
+		panic(err1)
+	}
+
+	results1 := raw1[0]
+	result2 := uint32(results1)
+	return result2
+}
+
 func (i *ResourcesSharedInstance) NewExportedBar(
 	ctx context.Context,
 	value string,
@@ -1308,6 +1416,36 @@ func (self *ExportedBar) Append(
 	if err2 != nil {
 		panic(err2)
 	}
+}
+
+func (i *ResourcesSharedInstance) TypesAClose(
+	ctx context.Context,
+) uint32 {
+	i.dropCollected(ctx)
+	raw0, err0 := i.module.ExportedFunction("arcjet:resources-shared/types-a#close").Call(ctx, )
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err0 != nil {
+		panic(err0)
+	}
+
+	results0 := raw0[0]
+	result1 := uint32(results0)
+	return result1
+}
+
+func (i *ResourcesSharedInstance) TypesAMake2(
+	ctx context.Context,
+) uint32 {
+	i.dropCollected(ctx)
+	raw0, err0 := i.module.ExportedFunction("arcjet:resources-shared/types-a#make").Call(ctx, )
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err0 != nil {
+		panic(err0)
+	}
+
+	results0 := raw0[0]
+	result1 := uint32(results0)
+	return result1
 }
 
 func (i *ResourcesSharedInstance) LabelFoo(
@@ -1799,5 +1937,20 @@ func (i *ResourcesSharedInstance) MakeFoo(
 	}
 	wrapped2 := adoptExportedTypesBFoo(i, resource2)
 	return wrapped2
+}
+
+func (i *ResourcesSharedInstance) UtilMake(
+	ctx context.Context,
+) uint32 {
+	i.dropCollected(ctx)
+	raw0, err0 := i.module.ExportedFunction("util#make").Call(ctx, )
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err0 != nil {
+		panic(err0)
+	}
+
+	results0 := raw0[0]
+	result1 := uint32(results0)
+	return result1
 }
 

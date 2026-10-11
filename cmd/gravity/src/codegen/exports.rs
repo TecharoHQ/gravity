@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use genco::prelude::*;
 use wit_bindgen_core::wit_parser::{
@@ -54,11 +54,13 @@ impl<'a> ExportGenerator<'a> {
     }
 
     /// Generate the Go function code for the given world-level function.
+    #[cfg(test)]
     fn generate_function(&self, func: &Function, tokens: &mut Tokens<Go>) {
+        let exported = crate::exported_resources(self.config.resolve, self.config.world);
         self.generate_export(
             func,
             &func.name,
-            &GoIdentifier::public(&func.name),
+            &self.method_names(&exported)[&func.name],
             Receiver::Instance,
             &ExportedResources::new(),
             tokens,
@@ -183,8 +185,8 @@ impl<'a> ExportGenerator<'a> {
     ) {
         let instance = self.config.instance;
         let go_name_str = String::from(go_name);
-        let dtor = format!("{interface_name}#[dtor]{name}");
-        let adopt = &GoIdentifier::private(format!("adopt-{}", go_name_str));
+        let dtor = crate::core_resource_dtor_name(interface_name, name);
+        let adopt = &crate::resource_adopt_name(go_name);
         let dropped = format!("{name} handle used after it was dropped or given away");
         let foreign = format!("{name} handle belongs to another instance");
         quote_in! { *tokens =>
@@ -266,7 +268,7 @@ impl<'a> ExportGenerator<'a> {
         key: &WorldKey,
         id: InterfaceId,
         exported: &ExportedResources,
-        collisions: &BTreeSet<String>,
+        method_names: &BTreeMap<String, GoIdentifier>,
         tokens: &mut Tokens<Go>,
     ) {
         let resolve = self.config.resolve;
@@ -304,31 +306,25 @@ impl<'a> ExportGenerator<'a> {
         }
 
         for func in interface.functions.values() {
-            let export_name = format!("{interface_name}#{}", func.name);
-            let go_name = Self::go_function_name(func, resolve, exported);
+            let export_name = crate::core_export_name(Some(&interface_name), &func.name);
+            let go_name = &method_names[&export_name];
             match func.kind {
                 FunctionKind::Method(resource) => {
                     let resource = GoIdentifier::public(&exported.resources[&resource]);
                     self.generate_export(
                         func,
                         &export_name,
-                        &GoIdentifier::public(go_name),
+                        go_name,
                         Receiver::Resource(&resource),
                         exported,
                         tokens,
                     );
                 }
                 _ => {
-                    let go_name = if collisions.contains(&go_name) {
-                        let interface = interface.name.as_deref().unwrap_or(&interface_name);
-                        format!("{interface}-{go_name}")
-                    } else {
-                        go_name
-                    };
                     self.generate_export(
                         func,
                         &export_name,
-                        &GoIdentifier::public(go_name),
+                        go_name,
                         Receiver::Instance,
                         exported,
                         tokens,
@@ -338,65 +334,104 @@ impl<'a> ExportGenerator<'a> {
         }
     }
 
-    /// Kebab-case Go name for a function of an exported interface.
-    ///
-    /// A constructor and a static function are named for the resource's Go
-    /// handle type (`new-accumulator`, `accumulator-combine`), which is
-    /// already unique in the package, where the bare resource name is not when
-    /// two interfaces declare the same one.
-    fn go_function_name(
-        func: &Function,
-        resolve: &Resolve,
-        exported: &ExportedResources,
-    ) -> String {
-        let item = || func.name.split_once('.').map_or("", |(_, item)| item);
-        match func.kind {
-            FunctionKind::Constructor(id) => format!("new-{}", exported.resources[&id]),
-            FunctionKind::Static(id) => format!("{}-{}", exported.resources[&id], item()),
-            _ => crate::function_go_name(func, resolve),
-        }
-    }
-
-    /// The Go names that more than one of the world's exports would give a
-    /// method of the instance type. An exported interface's functions share
-    /// the instance type with the world's own functions and with every other
-    /// exported interface, so the colliding ones are qualified with their
-    /// interface name.
-    fn instance_method_collisions(&self, exported: &ExportedResources) -> BTreeSet<String> {
+    /// Allocate names in each receiver's Go namespace. Reserve generated
+    /// lifecycle methods, keep unique original names, then qualify collisions.
+    /// A qualified name can itself collide with a world export, so each final
+    /// spelling is checked before it is assigned.
+    fn method_names(&self, exported: &ExportedResources) -> BTreeMap<String, GoIdentifier> {
         let resolve = self.config.resolve;
-        let mut seen = BTreeSet::new();
-        let mut collisions = BTreeSet::new();
-        let mut record = |name: String| {
-            if !seen.insert(name.clone()) {
-                collisions.insert(name);
-            }
-        };
-        for item in self.config.world.exports.values() {
+        let public = |name: &str| String::from(GoIdentifier::public(name));
+        let mut methods = Vec::new();
+        for (key, item) in &self.config.world.exports {
             match item {
-                WorldItem::Function(func) => record(func.name.clone()),
+                WorldItem::Function(func) => methods.push((
+                    crate::core_export_name(None, &func.name),
+                    String::new(),
+                    public(&crate::function_go_name(func, resolve)),
+                    self.config.world.name.clone(),
+                )),
                 WorldItem::Interface { id, .. } => {
-                    for func in resolve.interfaces[*id].functions.values() {
-                        if !matches!(func.kind, FunctionKind::Method(_)) {
-                            record(Self::go_function_name(func, resolve, exported));
+                    let interface = &resolve.interfaces[*id];
+                    let interface_name = resolve.name_world_key(key);
+                    // Inline interfaces use their world key; named interfaces
+                    // use their short WIT name, never the core export path.
+                    let prefix = match key {
+                        WorldKey::Name(name) => name.as_str(),
+                        WorldKey::Interface(_) => {
+                            interface.name.as_deref().expect("named interface")
                         }
+                    };
+                    for func in interface.functions.values() {
+                        let receiver = match func.kind {
+                            FunctionKind::Method(resource) => {
+                                public(&exported.resources[&resource])
+                            }
+                            _ => String::new(),
+                        };
+                        let qualifier = if receiver.is_empty() {
+                            prefix.to_string()
+                        } else {
+                            receiver.clone()
+                        };
+                        methods.push((
+                            crate::core_export_name(Some(&interface_name), &func.name),
+                            receiver,
+                            public(&crate::function_go_name_in(func, resolve, exported)),
+                            qualifier,
+                        ));
                     }
                 }
                 WorldItem::Type { .. } => (),
             }
         }
-        collisions
+        let mut counts = BTreeMap::new();
+        let mut used = BTreeSet::from([(String::new(), "Close".to_string())]);
+        for (_, receiver, name, _) in &methods {
+            if !receiver.is_empty() {
+                used.insert((receiver.clone(), "Drop".to_string()));
+            }
+            *counts.entry((receiver.clone(), name.clone())).or_insert(0) += 1;
+        }
+        let mut names = BTreeMap::new();
+        let mut pending = Vec::new();
+        for (export, receiver, name, prefix) in methods {
+            let key = (receiver.clone(), name.clone());
+            if counts[&key] == 1 && used.insert(key) {
+                names.insert(export, GoIdentifier::public(name));
+            } else {
+                pending.push((export, receiver, name, prefix));
+            }
+        }
+        for (export, receiver, name, prefix) in pending {
+            let base = public(&format!("{prefix}-{name}"));
+            let mut candidate = base.clone();
+            let mut suffix = 2;
+            while !used.insert((receiver.clone(), candidate.clone())) {
+                candidate = format!("{base}{suffix}");
+                suffix += 1;
+            }
+            names.insert(export, GoIdentifier::public(candidate));
+        }
+        names
     }
 }
 
 impl FormatInto<Go> for ExportGenerator<'_> {
     fn format_into(self, tokens: &mut Tokens<Go>) {
         let exported = &self.exported;
-        let collisions = self.instance_method_collisions(exported);
+        let method_names = self.method_names(exported);
         for (key, item) in self.config.world.exports.iter() {
             match item {
-                WorldItem::Function(func) => self.generate_function(func, tokens),
+                WorldItem::Function(func) => self.generate_export(
+                    func,
+                    &func.name,
+                    &method_names[&func.name],
+                    Receiver::Instance,
+                    &ExportedResources::new(),
+                    tokens,
+                ),
                 WorldItem::Interface { id, .. } => {
-                    self.generate_interface(key, *id, exported, &collisions, tokens)
+                    self.generate_interface(key, *id, exported, &method_names, tokens)
                 }
                 WorldItem::Type { .. } => todo!("generate type exports"),
             }
@@ -533,6 +568,60 @@ mod tests {
         let mut tokens = Tokens::new();
         ExportGenerator::new(config).format_into(&mut tokens);
         tokens.to_string().unwrap()
+    }
+
+    #[test]
+    fn test_reserved_export_methods() {
+        let fixture = Fixture::parse(
+            "package test:fixture;
+            interface things { resource thing { drop: func(); } close: func(); }
+            world test-world { export things; export close: func(); }",
+        );
+        let generated = generate_world(&fixture);
+        assert_eq!(generated.matches("func (self *Thing) Drop(").count(), 1);
+        assert!(generated.contains("func (self *Thing) ThingDrop("));
+        assert!(!generated.contains("func (i *TestInstance) Close("));
+        assert!(generated.contains("func (i *TestInstance) ThingsClose("));
+        assert!(generated.contains("func (i *TestInstance) TestWorldClose("));
+    }
+
+    #[test]
+    fn test_qualified_names_avoid_world_exports() {
+        let fixture = Fixture::parse(
+            "package test:fixture;
+            interface a { make: func(); }
+            world test-world {
+                export a; export make: func(); export a-make: func();
+                export test-world-make: func();
+            }",
+        );
+        let generated = generate_world(&fixture);
+        let mut names = std::collections::BTreeSet::new();
+        for line in generated
+            .lines()
+            .filter(|line| line.starts_with("func (i *TestInstance) "))
+        {
+            let name = line.split(") ").nth(1).unwrap().split('(').next().unwrap();
+            assert!(names.insert(name), "duplicate method {name}: {generated}");
+        }
+        assert_eq!(names.len(), 4);
+    }
+
+    #[test]
+    fn test_anonymous_export_collision_names_are_go_identifiers() {
+        let fixture = Fixture::parse(
+            "package test:fixture;
+            world test-world {
+                export util: interface { make: func(); }
+                export make: func();
+            }",
+        );
+        let generated = generate_world(&fixture);
+        assert!(
+            generated.contains("func (i *TestInstance) UtilMake("),
+            "{generated}"
+        );
+        assert!(generated.contains("func (i *TestInstance) TestWorldMake("));
     }
 
     /// A resource the guest implements becomes a Go handle type. The guest

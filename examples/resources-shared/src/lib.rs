@@ -25,6 +25,10 @@ impl types_a::GuestFoo for FooA {
         Self { x: Cell::new(x) }
     }
 
+    fn drop(&self) -> u32 {
+        self.x.get()
+    }
+
     fn get_x(&self) -> u32 {
         self.x.get()
     }
@@ -96,6 +100,14 @@ impl types_a::Guest for ResourcesWorld {
     type Foo = FooA;
     type Bar = Bar;
 
+    fn close() -> u32 {
+        101
+    }
+
+    fn make() -> u32 {
+        201
+    }
+
     fn label_foo(label: String, x: u32) -> types_a::Labeled {
         types_a::Labeled {
             label,
@@ -127,7 +139,25 @@ impl types_b::Guest for ResourcesWorld {
     }
 }
 
+impl exports::util::Guest for ResourcesWorld {
+    fn make() -> u32 {
+        301
+    }
+}
+
 impl Guest for ResourcesWorld {
+    fn close() -> u32 {
+        102
+    }
+
+    fn make() -> u32 {
+        202
+    }
+
+    fn types_a_make() -> u32 {
+        203
+    }
+
     fn use_host(x: u32, y: String) -> String {
         let foo_a = host_a::Foo::new(x);
         foo_a.set_x(foo_a.get_x() + 1);

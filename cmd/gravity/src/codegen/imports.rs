@@ -618,7 +618,7 @@ impl<'a> ImportCodeGenerator<'a> {
 
         for (name, table) in &module.resources {
             let message = format!("invalid {name} handle");
-            let dtor = format!("{}#[dtor]{name}", module.interface_name);
+            let dtor = crate::core_resource_dtor_name(&module.interface_name, name);
             chain.push();
             quote_in! { chain =>
                 NewFunctionBuilder().

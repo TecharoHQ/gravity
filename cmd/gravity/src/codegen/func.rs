@@ -1807,8 +1807,7 @@ impl Bindgen for Func<'_> {
                         // The table held the guest's representation; wrap it
                         // in the Go handle type.
                         let go_name = &GoIdentifier::public(go_name);
-                        let adopt =
-                            &GoIdentifier::private(format!("adopt-{}", String::from(go_name)));
+                        let adopt = &crate::resource_adopt_name(go_name);
                         let wrapped = &format!("wrapped{tmp}");
                         quote_in! { self.body =>
                             $['\r']

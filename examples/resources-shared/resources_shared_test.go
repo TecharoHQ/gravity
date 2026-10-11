@@ -14,6 +14,7 @@ type fooA struct {
 	h *host
 }
 
+func (f *fooA) Drop(ctx context.Context) uint32    { return f.x }
 func (f *fooA) GetX(ctx context.Context) uint32    { return f.x }
 func (f *fooA) SetX(ctx context.Context, n uint32) { f.x = n }
 func (f *fooA) ResourceDrop(ctx context.Context)   { f.h.dropped++ }
@@ -51,6 +52,9 @@ type host struct {
 }
 
 type hostA struct{ h *host }
+
+func (a hostA) Close(ctx context.Context) uint32 { return 101 }
+func (a hostA) Make(ctx context.Context) uint32  { return 201 }
 
 func (a hostA) NewFoo(ctx context.Context, x uint32) TypesAFoo { return &fooA{x: x, h: a.h} }
 func (a hostA) NewBar(ctx context.Context, value string) Bar   { return &bar{value: value, h: a.h} }
@@ -154,6 +158,38 @@ func TestGuestSide(t *testing.T) {
 	for _, drop := range []func(context.Context) error{foo.Drop, made.Drop, fooB.Drop, baz.Drop} {
 		if err := drop(ctx); err != nil {
 			t.Error(err)
+		}
+	}
+}
+
+// WIT lifecycle names and qualified world exports must stay callable beside
+// the generated Close and Drop methods, on the exported side of shared types.
+func TestExportMethodNames(t *testing.T) {
+	_, ins := setup(t)
+	ctx := t.Context()
+	foo := ins.NewExportedTypesAFoo(ctx, 17)
+	if got := foo.ExportedTypesAFooDrop(ctx); got != 17 {
+		t.Fatalf("resource drop method: got %d, want 17", got)
+	}
+	if got := foo.GetX(ctx); got != 17 {
+		t.Fatalf("WIT drop unexpectedly destroyed handle: got %d", got)
+	}
+	if err := foo.Drop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for name, call := range map[string]struct {
+		run  func(context.Context) uint32
+		want uint32
+	}{
+		"interface close":       {ins.TypesAClose, 101},
+		"world close":           {ins.ResourcesSharedClose, 102},
+		"interface make":        {ins.TypesAMake2, 201},
+		"world make":            {ins.ResourcesSharedMake, 202},
+		"qualified world name":  {ins.TypesAMake, 203},
+		"inline interface make": {ins.UtilMake, 301},
+	} {
+		if got := call.run(ctx); got != call.want {
+			t.Errorf("%s: got %d, want %d", name, got, call.want)
 		}
 	}
 }
