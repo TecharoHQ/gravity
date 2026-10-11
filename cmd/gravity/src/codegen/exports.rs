@@ -56,11 +56,11 @@ impl<'a> ExportGenerator<'a> {
     /// Generate the Go function code for the given world-level function.
     #[cfg(test)]
     fn generate_function(&self, func: &Function, tokens: &mut Tokens<Go>) {
-        let exported = crate::exported_resources(self.config.resolve, self.config.world);
+        let exported = &self.exported;
         self.generate_export(
             func,
             &func.name,
-            &self.method_names(&exported)[&func.name],
+            &self.method_names(exported)[&func.name],
             Receiver::Instance,
             &ExportedResources::new(),
             tokens,
@@ -676,8 +676,15 @@ mod tests {
         assert!(generated.contains("arg0 := self"));
         assert!(generated.contains("arg0.lend(i)"));
 
-        // An owned parameter becomes a new handle and spends the Go handle.
-        assert!(generated.contains("i.resources.exportedThing.add(arg0.give(i), true)"));
+        // Ownership is staged while parameters are lowered, then committed
+        // immediately before entering the guest.
+        assert!(generated.contains("i.resources.exportedThing.add(ownedResource0.lend(i), true)"));
+        let lowered = generated.find("handle2 := arg1.lend(i)").unwrap();
+        let committed = generated
+            .find("for _, commit := range commitResources")
+            .unwrap();
+        let called = generated.find("#[static]thing.join\").Call").unwrap();
+        assert!(lowered < committed && committed < called);
         assert!(generated.contains("arg1.lend(i)"));
 
         assert!(generated.contains("func (i *TestInstance) Peek("));
