@@ -44,6 +44,8 @@ interface guest {
 
   sum: func(a: borrow<accumulator>) -> u32;
   finish: func(a: accumulator) -> u32;
+  finish-pair: func(a: accumulator, b: accumulator) -> u32;
+  finish-text: func(a: accumulator, text: string) -> u32;
   make: func(label: string, n: u32) -> accumulator;
   try-make: func(label: string) -> result<accumulator, string>;
   /// The number of accumulators the guest has not dropped yet.
@@ -68,6 +70,11 @@ world resources {
   export ticks: func(start: u32, n: u32) -> u32;
   /// Returns without dropping the borrowed handle, which the host must trap.
   export forget: func(c: borrow<counter>);
+  export trap-borrow: func(c: borrow<counter>) -> result<u32, string>;
+  export borrow-text: func(c: borrow<counter>, text: string) -> result<u32, string>;
+  export retain-and-trap: func(c: counter) -> result<u32, string>;
+  export retained: func() -> counter;
+  export take-text: func(c: counter, text: string) -> result<u32, string>;
 
   /// Increments a counter the host owns and returns its new value.
   export bump: func(c: borrow<counter>) -> u32;

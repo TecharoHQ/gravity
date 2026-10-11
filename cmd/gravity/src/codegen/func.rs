@@ -53,6 +53,10 @@ pub struct Func<'a> {
     /// The handle tables this export lent a borrowed handle from, with the
     /// resource's name. The guest must drop those handles before it returns.
     lent: Vec<(String, String)>,
+    /// Export lowerings provision handles, rolling back until CallWasm starts.
+    staged_ownership: bool,
+    /// Guest handles are validated and reserved before spending any of them.
+    staged_guest_ownership: bool,
 }
 
 impl<'a> Func<'a> {
@@ -71,6 +75,8 @@ impl<'a> Func<'a> {
             exported: ExportedResources::new(),
             export_name: None,
             lent: Vec::new(),
+            staged_ownership: false,
+            staged_guest_ownership: false,
         }
     }
 
@@ -88,6 +94,8 @@ impl<'a> Func<'a> {
             exported: ExportedResources::new(),
             export_name: None,
             lent: Vec::new(),
+            staged_ownership: false,
+            staged_guest_ownership: false,
         }
     }
 
@@ -176,8 +184,16 @@ impl<'a> Func<'a> {
         &self.result
     }
 
-    pub fn body(&self) -> &Tokens<Go> {
-        &self.body
+    pub fn body(&self) -> Tokens<Go> {
+        quote! {
+            $(if self.staged_ownership { resourcesTransferred := false
+                $['\r'] })
+            $(if self.staged_guest_ownership {
+                var commitResources []func()
+                reservedResources := make(map[any]bool)
+            })
+            $(&self.body)
+        }
     }
 
     fn push_arg(&mut self, value: &str) {
@@ -314,6 +330,17 @@ impl Bindgen for Func<'_> {
                 let ret = &format!("results{tmp}");
                 let err = &format!("err{tmp}");
                 let default = &format!("default{tmp}");
+                // Once the guest starts executing, ownership stays with it
+                // even if it traps: it may already have retained the resource.
+                quote_in! { self.body =>
+                    $(if self.staged_ownership { $['\r'] })
+                    $(if self.staged_guest_ownership {
+                        for _, commit := range commitResources {
+                            commit()
+                        }
+                    })
+                    $(if self.staged_ownership { resourcesTransferred = true })
+                };
                 // TODO(#17): Wrapping every argument in `uint64` is bad and we should instead be looking
                 // at the types and converting with proper guards in place
                 quote_in! { self.body =>
@@ -1693,7 +1720,30 @@ impl Bindgen for Func<'_> {
                     // borrow as the representation itself, with no handle in
                     // between, and an owned value as a new handle, after
                     // which the Go handle is spent.
-                    if owned {
+                    if owned && matches!(self.direction, Direction::Export) {
+                        self.staged_ownership = true;
+                        self.staged_guest_ownership = true;
+                        let value = &format!("ownedResource{tmp}");
+                        quote_in! { self.body =>
+                            $['\r']
+                            $value := $operand
+                            $result := $table.add($value.lend(i), true)
+                            defer func() {
+                                if !resourcesTransferred {
+                                    $table.remove($result)
+                                }
+                            }()
+                        };
+                        self.fail_if(
+                            &format!("reservedResources[{value}]"),
+                            &format!("{name} handle given away more than once"),
+                        );
+                        quote_in! { self.body =>
+                            $['\r']
+                            reservedResources[$value] = true
+                            commitResources = append(commitResources, func() { $value.give(i) })
+                        };
+                    } else if owned {
                         quote_in! { self.body =>
                             $['\r']
                             $result := $table.add($operand.give(i), true)
@@ -1715,9 +1765,23 @@ impl Bindgen for Func<'_> {
                     {
                         self.lent.push((table.clone(), name.to_string()));
                     }
+                    if owned && matches!(self.direction, Direction::Export) {
+                        self.staged_ownership = true;
+                    }
                     quote_in! { self.body =>
                         $['\r']
                         $result := $table.add($operand, $own)
+                        $(if matches!(self.direction, Direction::Export) {
+                            $(if owned {
+                                defer func() {
+                                    if !resourcesTransferred {
+                                        $table.remove($result)
+                                    }
+                                }()
+                            } else {
+                                defer $table.dropBorrows()
+                            })
+                        })
                     };
                 }
                 results.push(Operand::SingleValue(result.into()));

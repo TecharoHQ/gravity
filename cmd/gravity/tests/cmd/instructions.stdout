@@ -6,11 +6,25 @@ import "context"
 import "errors"
 import "github.com/tetratelabs/wazero"
 import "github.com/tetratelabs/wazero/api"
+import "strconv"
+import "sync"
+import "sync/atomic"
 
 import _ "embed"
 
 //go:embed instructions.wasm
 var wasmFileInstructions []byte
+
+type IInstructionsHandles interface {}
+
+// Token is the `token` resource, which the host implements.
+// When the guest drops the last handle that owns a value, gravity calls the
+// value's `ResourceDrop(ctx context.Context)` method if it has one.
+type Token interface {
+	Value(
+		ctx context.Context,
+	) uint32
+}
 
 type EnumValues interface {
 	isEnumValues()
@@ -48,12 +62,68 @@ type WideParams struct {
 type InstructionsFactory struct {
 	runtime wazero.Runtime
 	module wazero.CompiledModule
+	// instances maps a module instance's name to its resource tables.
+	instances *sync.Map
+	nextInstance atomic.Uint64
 }
 
 func NewInstructionsFactory(
 	ctx context.Context,
+	handles IInstructionsHandles,
 ) (*InstructionsFactory, error) {
 	wazeroRuntime := wazero.NewRuntime(ctx)
+
+	instances := &sync.Map{}
+	// resourcesOf returns the resource tables of the instance calling a host function.
+	resourcesOf := func(mod api.Module) *instructionsResourceTables {
+		tables, ok := instances.Load(mod.Name())
+		if !ok {
+			panic(errors.New("module instance has no resource tables"))
+		}
+		return tables.(*instructionsResourceTables)
+	}
+
+	_, err0 := wazeroRuntime.NewHostModuleBuilder("gravity:instructions/handles").
+	NewFunctionBuilder().
+	WithFunc(func(
+		ctx context.Context,
+		mod api.Module,
+		arg0 uint32,
+	) uint32{
+		resource0, ok0 := resourcesOf(mod).importedToken.get(uint32(arg0))
+		// The return type doesn't contain an error so we panic if one is encountered
+		if !ok0 {
+			panic(errors.New("invalid token handle"))
+		}
+		value2 := resource0.Value(ctx, )
+		result3 := uint32(value2)
+		return result3
+	}).
+	Export("[method]token.value").
+	NewFunctionBuilder().
+	WithFunc(func(
+		ctx context.Context,
+		mod api.Module,
+		handle uint32,
+	) {
+		value, own, ok := resourcesOf(mod).importedToken.remove(handle)
+		if !ok {
+			panic(errors.New("invalid token handle"))
+		}
+		// A borrowed handle does not own the value, so dropping it leaves the
+		// value alone.
+		if !own {
+			return
+		}
+		if dropper, ok := any(value).(interface{ ResourceDrop(ctx context.Context) }); ok {
+			dropper.ResourceDrop(ctx)
+		}
+	}).
+	Export("[resource-drop]token").
+	Instantiate(ctx)
+	if err0 != nil {
+		return nil, err0
+	}
 
 	// Compiling the module takes a LONG time, so we want to do it once and hold
 	// onto it with the Runtime
@@ -64,15 +134,26 @@ func NewInstructionsFactory(
 	return &InstructionsFactory{
 		runtime: wazeroRuntime,
 		module: module,
+		instances: instances,
 	}, nil
 }
 
 func (f *InstructionsFactory) Instantiate(ctx context.Context) (*InstructionsInstance, error) {
-	if module, err := f.runtime.InstantiateModule(ctx, f.module, wazero.NewModuleConfig()); err != nil {
+	// The tables are registered before the module starts, because its start
+	// function may already call host functions that use them.
+	name := "gravity-" + strconv.FormatUint(f.nextInstance.Add(1), 10)
+	resources := &instructionsResourceTables{}
+	f.instances.Store(name, resources)
+	module, err := f.runtime.InstantiateModule(ctx, f.module, wazero.NewModuleConfig().WithName(name))
+	if err != nil {
+		f.instances.Delete(name)
 		return nil, err
-	} else {
-		return &InstructionsInstance{module}, nil
 	}
+	return &InstructionsInstance{
+		module: module,
+		resources: resources,
+		release: func() { f.instances.Delete(name) },
+	}, nil
 }
 
 func (f *InstructionsFactory) Close(ctx context.Context) {
@@ -81,14 +162,134 @@ func (f *InstructionsFactory) Close(ctx context.Context) {
 
 type InstructionsInstance struct {
 	module api.Module
+	resources *instructionsResourceTables
+	// release removes the instance's resource tables from its factory.
+	release func()
 }
 
+// Close closes the module instance. The guest's resources go away with it,
+// so handles to them must not be used afterwards.
 func (i *InstructionsInstance) Close(ctx context.Context) error {
+	defer i.release()
 	if err := i.module.Close(ctx); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// resourceHandle is one entry of a resourceTable.
+type resourceHandle[T any] struct {
+	value T
+	// own is false for a handle that only borrows the value.
+	own bool
+	live bool
+}
+
+// resourceTable is a Component Model handle table. The guest refers to a
+// resource by a handle, an index into this table. Handles start at 1 and the
+// index of a removed handle is reused.
+type resourceTable[T any] struct {
+	mu sync.Mutex
+	entries []resourceHandle[T]
+	free []uint32
+	// borrows counts the live handles that do not own their value.
+	borrows int
+}
+
+// add stores value and returns its new handle.
+func (t *resourceTable[T]) add(value T, own bool) uint32 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	entry := resourceHandle[T]{value: value, own: own, live: true}
+	if !own {
+		t.borrows++
+	}
+	if n := len(t.free); n > 0 {
+		handle := t.free[n-1]
+		t.free = t.free[:n-1]
+		t.entries[handle-1] = entry
+		return handle
+	}
+	t.entries = append(t.entries, entry)
+	return uint32(len(t.entries))
+}
+
+func (t *resourceTable[T]) lookup(handle uint32) *resourceHandle[T] {
+	if handle == 0 || uint64(handle) > uint64(len(t.entries)) || !t.entries[handle-1].live {
+		return nil
+	}
+	return &t.entries[handle-1]
+}
+
+// get returns the value of a handle and leaves the handle in the table.
+func (t *resourceTable[T]) get(handle uint32) (value T, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	entry := t.lookup(handle)
+	if entry == nil {
+		return value, false
+	}
+	return entry.value, true
+}
+
+// remove deletes a handle and reports whether it owned its value.
+func (t *resourceTable[T]) remove(handle uint32) (value T, own bool, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	entry := t.lookup(handle)
+	if entry == nil {
+		return value, false, false
+	}
+	value, own = entry.value, entry.own
+	if !own {
+		t.borrows--
+	}
+	*entry = resourceHandle[T]{}
+	t.free = append(t.free, handle)
+	return value, own, true
+}
+
+// dropBorrows removes the borrowed handles that are still in the table and
+// returns how many there were. A borrow ends with the call that lent it, so
+// the guest must have dropped every one by the time the call returns.
+func (t *resourceTable[T]) dropBorrows() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	kept := t.borrows
+	if kept == 0 {
+		return 0
+	}
+	for index := range t.entries {
+		if entry := &t.entries[index]; entry.live && !entry.own {
+			*entry = resourceHandle[T]{}
+			t.free = append(t.free, uint32(index+1))
+		}
+	}
+	t.borrows = 0
+	return kept
+}
+
+// take deletes a handle that owns its value and returns the value. It fails
+// for a borrowed handle, which cannot transfer ownership.
+func (t *resourceTable[T]) take(handle uint32) (value T, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	entry := t.lookup(handle)
+	if entry == nil || !entry.own {
+		return value, false
+	}
+	value = entry.value
+	*entry = resourceHandle[T]{}
+	t.free = append(t.free, handle)
+	return value, true
+}
+
+// The resource tables of one module instance: the host's values for the
+// resources it implements, and the guest's representations for the resources
+// the guest implements.
+type instructionsResourceTables struct {
+	importedToken resourceTable[Token]
 }
 
 // writeString will put a Go string into the Wasm memory following the Component
@@ -113,6 +314,70 @@ func writeString(
 		return 1, 0, errors.New("failed to write string to wasm memory")
 	}
 	return uint64(ptr), uint64(len(s)), nil
+}
+
+func (i *InstructionsInstance) HandleRoundtrip(
+	ctx context.Context,
+	val Token,
+) Token {
+	arg0 := val
+	resourcesTransferred := false
+	handle0 := i.resources.importedToken.add(arg0, true)
+	defer func() {
+		if !resourcesTransferred {
+			i.resources.importedToken.remove(handle0)
+		}
+	}()
+	resourcesTransferred = true
+	raw1, err1 := i.module.ExportedFunction("handle-roundtrip").Call(ctx, uint64(handle0))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err1 != nil {
+		panic(err1)
+	}
+
+	// The cleanup via `cabi_post_*` cleans up the memory in the guest. By
+	// deferring this, we ensure that no memory is corrupted before the function
+	// is done accessing it.
+	defer func() {
+		if postFn := i.module.ExportedFunction("cabi_post_handle-roundtrip"); postFn != nil {
+			if _, err := postFn.Call(ctx, raw1...); err != nil {
+				// If we get an error during cleanup, something really bad is
+				// going on, so we panic. Also, you can't return the error from
+				// the `defer`
+				panic(errors.New("failed to cleanup"))
+			}
+		}
+	}()
+
+	results1 := raw1[0]
+	resource2, ok2 := i.resources.importedToken.take(uint32(results1))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if !ok2 {
+		panic(errors.New("invalid token handle"))
+	}
+	return resource2
+}
+
+func (i *InstructionsInstance) HandleBorrow(
+	ctx context.Context,
+	val Token,
+) uint32 {
+	arg0 := val
+	handle0 := i.resources.importedToken.add(arg0, false)
+	defer i.resources.importedToken.dropBorrows()
+	raw1, err1 := i.module.ExportedFunction("handle-borrow").Call(ctx, uint64(handle0))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err1 != nil {
+		panic(err1)
+	}
+
+	results1 := raw1[0]
+	// The return type doesn't contain an error so we panic if one is encountered
+	if i.resources.importedToken.dropBorrows() != 0 {
+		panic(errors.New("guest kept a borrowed token handle after the call returned"))
+	}
+	result3 := uint32(results1)
+	return result3
 }
 
 func (i *InstructionsInstance) S8Roundtrip(

@@ -1,6 +1,16 @@
 package gravity:instructions;
 
+interface handles {
+  resource token {
+    value: func() -> u32;
+  }
+}
+
 world instructions {
+  import handles;
+  use handles.{token};
+  export handle-roundtrip: func(val: token) -> token;
+  export handle-borrow: func(val: borrow<token>) -> u32;
   export s8-roundtrip: func(val: s8) -> s8;
 
   export u8-roundtrip: func(val: u8) -> u8;

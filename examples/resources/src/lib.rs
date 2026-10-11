@@ -20,6 +20,7 @@ struct ResourcesWorld;
 export!(ResourcesWorld);
 
 thread_local! {
+    static RETAINED: RefCell<Option<Counter>> = const { RefCell::new(None) };
     static LIVE: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -107,6 +108,14 @@ impl GuestInterface for ResourcesWorld {
         a.get::<Acc>().total()
     }
 
+    fn finish_pair(a: Accumulator, b: Accumulator) -> u32 {
+        a.get::<Acc>().total() + b.get::<Acc>().total()
+    }
+
+    fn finish_text(a: Accumulator, _text: String) -> u32 {
+        a.get::<Acc>().total()
+    }
+
     fn make(label: String, n: u32) -> Accumulator {
         Accumulator::new(Acc::with(label, n))
     }
@@ -136,6 +145,27 @@ impl Guest for ResourcesWorld {
         // Taking the handle out of the binding stops it from dropping the
         // borrow when this function returns.
         let _ = c.take_handle();
+    }
+
+    fn trap_borrow(_c: &Counter) -> Result<u32, String> {
+        core::arch::wasm32::unreachable()
+    }
+
+    fn borrow_text(c: &Counter, _text: String) -> Result<u32, String> {
+        Ok(c.get())
+    }
+
+    fn retain_and_trap(c: Counter) -> Result<u32, String> {
+        RETAINED.with(|retained| *retained.borrow_mut() = Some(c));
+        core::arch::wasm32::unreachable()
+    }
+
+    fn retained() -> Counter {
+        RETAINED.with(|retained| retained.borrow_mut().take().unwrap())
+    }
+
+    fn take_text(c: Counter, _text: String) -> Result<u32, String> {
+        Ok(c.get())
     }
 
     fn bump(c: &Counter) -> u32 {

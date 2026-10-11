@@ -7,6 +7,12 @@ struct InstructionsWorld;
 export!(InstructionsWorld);
 
 impl Guest for InstructionsWorld {
+    fn handle_roundtrip(val: Token) -> Token {
+        val
+    }
+    fn handle_borrow(val: &Token) -> u32 {
+        val.value()
+    }
     fn s8_roundtrip(val: i8) -> i8 {
         assert!((i8::MIN..=i8::MAX).contains(&val));
         val

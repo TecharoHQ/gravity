@@ -2,7 +2,9 @@ package resources
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/tetratelabs/wazero/api"
 	"runtime"
 	"testing"
 	"time"
@@ -485,5 +487,130 @@ func TestGuestResourceInRecordAndVariant(t *testing.T) {
 	}
 	if got := ins.Live(ctx); got != 0 {
 		t.Errorf("wanted no live accumulators, but got: %d", got)
+	}
+}
+
+func TestFailedBorrowDoesNotPoisonTable(t *testing.T) {
+	for _, trapped := range []bool{false, true} {
+		t.Run(fmt.Sprint(trapped), func(t *testing.T) {
+			h, ins := setup(t)
+			c := &counter{n: 1, host: h}
+			var err error
+			if trapped {
+				_, err = ins.TrapBorrow(t.Context(), c)
+			} else {
+				restore := failAllocation(ins)
+				_, err = ins.BorrowText(t.Context(), c, "fail allocation")
+				restore()
+			}
+			if err == nil {
+				t.Fatal("wanted failure")
+			}
+			if n := live(&ins.resources.importedCounter); n != 0 {
+				t.Fatalf("failed call left %d borrows", n)
+			}
+			if got := ins.Bump(t.Context(), c); got != 2 {
+				t.Fatalf("next borrow returned %d", got)
+			}
+		})
+	}
+}
+
+func TestFailedOwnedLoweringPreservesGuestHandle(t *testing.T) {
+	_, ins := setup(t)
+	a := ins.Make(t.Context(), "a", 5)
+	b := ins.Make(t.Context(), "b", 9)
+	if err := b.Drop(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	wantPanic(t, "invalid second handle", func() { ins.FinishPair(t.Context(), a, b) })
+	if a.dropped {
+		t.Fatal("first handle spent before call")
+	}
+	if n := live(&ins.resources.exportedAccumulator); n != 0 {
+		t.Fatalf("failed lowering left %d owned handles", n)
+	}
+	restore := failAllocation(ins)
+	wantPanic(t, "allocation failure", func() { ins.FinishText(t.Context(), a, "fail allocation") })
+	restore()
+	if got := a.Total(t.Context()); got != 5 {
+		t.Fatalf("preserved handle returned %d", got)
+	}
+	if got := ins.Finish(t.Context(), a); got != 5 {
+		t.Fatalf("transfer returned %d", got)
+	}
+}
+
+func TestFailedOwnedLoweringRemovesHostEntry(t *testing.T) {
+	h, ins := setup(t)
+	c := &counter{n: 5, host: h}
+	restore := failAllocation(ins)
+	if _, err := ins.TakeText(t.Context(), c, "fail allocation"); err == nil {
+		t.Fatal("wanted failure")
+	}
+	if n := live(&ins.resources.importedCounter); n != 0 {
+		t.Fatalf("failed lowering left %d owned handles", n)
+	}
+	if len(h.dropped) != 0 {
+		t.Fatal("lowering failure dropped caller's resource")
+	}
+	restore()
+	if got := ins.Take(t.Context(), c); got != 5 {
+		t.Fatalf("transfer returned %d", got)
+	}
+}
+
+// Inject the allocator failure that occurs before the target export is entered.
+// All other module operations use the real wazero instance.
+type allocationFailureModule struct{ api.Module }
+type allocationFailureFunction struct{ api.Function }
+
+func (m allocationFailureModule) ExportedFunction(name string) api.Function {
+	f := m.Module.ExportedFunction(name)
+	if name == "cabi_realloc" {
+		return allocationFailureFunction{f}
+	}
+	return f
+}
+func (f allocationFailureFunction) Call(context.Context, ...uint64) ([]uint64, error) {
+	return nil, errors.New("allocation failed")
+}
+func failAllocation(ins *ResourcesInstance) func() {
+	original := ins.module
+	ins.module = allocationFailureModule{original}
+	return func() { ins.module = original }
+}
+
+// Ownership crosses into the guest at Call, including calls that trap after
+// storing the resource. Rolling that transfer back would leave a stale handle.
+func TestTrapPreservesGuestOwnership(t *testing.T) {
+	h, ins := setup(t)
+	c := &counter{n: 5, host: h}
+	if _, err := ins.RetainAndTrap(t.Context(), c); err == nil {
+		t.Fatal("wanted a trap")
+	}
+	if n := live(&ins.resources.importedCounter); n != 1 {
+		t.Fatalf("guest's owned handle lost: %d", n)
+	}
+	if got := ins.Retained(t.Context()); got != Counter(c) {
+		t.Fatalf("retained resource: %v", got)
+	}
+	if n := live(&ins.resources.importedCounter); n != 0 {
+		t.Fatalf("returned ownership left %d handles", n)
+	}
+	if len(h.dropped) != 0 {
+		t.Fatal("trap dropped resource still owned by guest")
+	}
+}
+
+func TestDuplicateOwnedHandleLoweringPreservesHandle(t *testing.T) {
+	_, ins := setup(t)
+	a := ins.Make(t.Context(), "a", 5)
+	wantPanic(t, "duplicate owned handle", func() { ins.FinishPair(t.Context(), a, a) })
+	if got := a.Total(t.Context()); got != 5 {
+		t.Fatalf("preserved handle returned %d", got)
+	}
+	if n := live(&ins.resources.exportedAccumulator); n != 0 {
+		t.Fatalf("duplicate lowering left %d handles", n)
 	}
 }

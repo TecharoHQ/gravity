@@ -1,6 +1,7 @@
 package instructions
 
 import (
+	"context"
 	"fmt"
 	"iter"
 	"math"
@@ -46,7 +47,7 @@ func inclusiveStep[Num interface{ ~int32 | ~uint32 }](start Num, end Num, step N
 }
 
 func Test_S8Roundtrip(t *testing.T) {
-	fac, err := NewInstructionsFactory(t.Context())
+	fac, err := NewInstructionsFactory(t.Context(), instructionHandles{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +68,7 @@ func Test_S8Roundtrip(t *testing.T) {
 }
 
 func Test_U8Roundtrip(t *testing.T) {
-	fac, err := NewInstructionsFactory(t.Context())
+	fac, err := NewInstructionsFactory(t.Context(), instructionHandles{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +89,7 @@ func Test_U8Roundtrip(t *testing.T) {
 }
 
 func Test_S16Roundtrip(t *testing.T) {
-	fac, err := NewInstructionsFactory(t.Context())
+	fac, err := NewInstructionsFactory(t.Context(), instructionHandles{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +110,7 @@ func Test_S16Roundtrip(t *testing.T) {
 }
 
 func Test_U16Roundtrip(t *testing.T) {
-	fac, err := NewInstructionsFactory(t.Context())
+	fac, err := NewInstructionsFactory(t.Context(), instructionHandles{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +131,7 @@ func Test_U16Roundtrip(t *testing.T) {
 }
 
 func Test_S32Roundtrip(t *testing.T) {
-	fac, err := NewInstructionsFactory(t.Context())
+	fac, err := NewInstructionsFactory(t.Context(), instructionHandles{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +152,7 @@ func Test_S32Roundtrip(t *testing.T) {
 }
 
 func Test_U32Roundtrip(t *testing.T) {
-	fac, err := NewInstructionsFactory(t.Context())
+	fac, err := NewInstructionsFactory(t.Context(), instructionHandles{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +173,7 @@ func Test_U32Roundtrip(t *testing.T) {
 }
 
 func Test_F32Roundtrip(t *testing.T) {
-	fac, err := NewInstructionsFactory(t.Context())
+	fac, err := NewInstructionsFactory(t.Context(), instructionHandles{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +199,7 @@ func Test_F32Roundtrip(t *testing.T) {
 }
 
 func Test_F64Roundtrip(t *testing.T) {
-	fac, err := NewInstructionsFactory(t.Context())
+	fac, err := NewInstructionsFactory(t.Context(), instructionHandles{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +225,7 @@ func Test_F64Roundtrip(t *testing.T) {
 }
 
 func Test_EnumInput(t *testing.T) {
-	fac, err := NewInstructionsFactory(t.Context())
+	fac, err := NewInstructionsFactory(t.Context(), instructionHandles{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +248,7 @@ func Test_EnumInput(t *testing.T) {
 // field into it and pass a single pointer. The guest echoes every field back so
 // a wrong size, alignment or store offset shows up as a mismatched string.
 func Test_IndirectParams(t *testing.T) {
-	fac, err := NewInstructionsFactory(t.Context())
+	fac, err := NewInstructionsFactory(t.Context(), instructionHandles{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,5 +282,33 @@ func Test_IndirectParams(t *testing.T) {
 	want := "wide:1,2,3,4,5,6,7,8,9,10,11,12,13,14,4294967295"
 	if got := ins.IndirectParams(t.Context(), val); got != want {
 		t.Errorf("expected: %q, but got: %q", want, got)
+	}
+}
+
+type instructionHandles struct{}
+
+func (instructionHandles) ResourceDropToken(context.Context, Token) {}
+
+type instructionToken uint32
+
+func (val instructionToken) Value(context.Context) uint32 { return uint32(val) }
+
+func TestHandleInstructions(t *testing.T) {
+	fac, err := NewInstructionsFactory(t.Context(), instructionHandles{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fac.Close(t.Context())
+	ins, err := fac.Instantiate(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ins.Close(t.Context())
+	val := instructionToken(42)
+	if got := ins.HandleBorrow(t.Context(), val); got != 42 {
+		t.Fatalf("borrow returned %d", got)
+	}
+	if got := ins.HandleRoundtrip(t.Context(), val); got != Token(val) {
+		t.Fatalf("roundtrip returned %v", got)
 	}
 }

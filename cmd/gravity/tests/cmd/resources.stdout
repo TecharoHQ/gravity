@@ -647,6 +647,7 @@ func (i *ResourcesInstance) Forget(
 	i.dropCollected(ctx)
 	arg0 := c
 	handle0 := i.resources.importedCounter.add(arg0, false)
+	defer i.resources.importedCounter.dropBorrows()
 	_, err1 := i.module.ExportedFunction("forget").Call(ctx, uint64(handle0))
 	// The return type doesn't contain an error so we panic if one is encountered
 	if err1 != nil {
@@ -659,6 +660,353 @@ func (i *ResourcesInstance) Forget(
 	}
 }
 
+func (i *ResourcesInstance) TrapBorrow(
+	ctx context.Context,
+	c Counter,
+) (uint32, error) {
+	i.dropCollected(ctx)
+	arg0 := c
+	handle0 := i.resources.importedCounter.add(arg0, false)
+	defer i.resources.importedCounter.dropBorrows()
+	raw1, err1 := i.module.ExportedFunction("trap-borrow").Call(ctx, uint64(handle0))
+	if err1 != nil {
+		var default1 uint32
+		return default1, err1
+	}
+
+	// The cleanup via `cabi_post_*` cleans up the memory in the guest. By
+	// deferring this, we ensure that no memory is corrupted before the function
+	// is done accessing it.
+	defer func() {
+		if postFn := i.module.ExportedFunction("cabi_post_trap-borrow"); postFn != nil {
+			if _, err := postFn.Call(ctx, raw1...); err != nil {
+				// If we get an error during cleanup, something really bad is
+				// going on, so we panic. Also, you can't return the error from
+				// the `defer`
+				panic(errors.New("failed to cleanup"))
+			}
+		}
+	}()
+
+	results1 := raw1[0]
+	if i.resources.importedCounter.dropBorrows() != 0 {
+		var default2 uint32
+		return default2, errors.New("guest kept a borrowed counter handle after the call returned")
+	}
+	value3, ok3 := i.module.Memory().ReadByte(uint32(results1 + 0))
+	if !ok3 {
+		var default3 uint32
+		return default3, errors.New("failed to read byte from memory")
+	}
+	var value9 uint32
+	var err9 error
+	switch value3 {
+	case 0:
+		value4, ok4 := i.module.Memory().ReadUint32Le(uint32(results1 + 4))
+		if !ok4 {
+			var default4 uint32
+			return default4, errors.New("failed to read i32 from memory")
+		}
+		result5 := uint32(value4)
+		value9 = result5
+	case 1:
+		ptr6, ok6 := i.module.Memory().ReadUint32Le(uint32(results1 + 4))
+		if !ok6 {
+			var default6 uint32
+			return default6, errors.New("failed to read pointer from memory")
+		}
+		len7, ok7 := i.module.Memory().ReadUint32Le(uint32(results1 + 8))
+		if !ok7 {
+			var default7 uint32
+			return default7, errors.New("failed to read length from memory")
+		}
+		buf8, ok8 := i.module.Memory().Read(ptr6, len7)
+		if !ok8 {
+			var default8 uint32
+			return default8, errors.New("failed to read bytes from memory")
+		}
+		str8 := string(buf8)
+		err9 = errors.New(str8)
+	default:
+		err9 = errors.New("invalid variant discriminant for expected")
+	}
+	return value9, err9
+}
+
+func (i *ResourcesInstance) BorrowText(
+	ctx context.Context,
+	c Counter,
+	text string,
+) (uint32, error) {
+	i.dropCollected(ctx)
+	arg0 := c
+	arg1 := text
+	handle0 := i.resources.importedCounter.add(arg0, false)
+	defer i.resources.importedCounter.dropBorrows()
+	memory1 := i.module.Memory()
+	realloc1 := i.module.ExportedFunction("cabi_realloc")
+	ptr1, len1, err1 := writeString(ctx, arg1, memory1, realloc1)
+	if err1 != nil {
+		var default1 uint32
+		return default1, err1
+	}
+	raw2, err2 := i.module.ExportedFunction("borrow-text").Call(ctx, uint64(handle0), uint64(ptr1), uint64(len1))
+	if err2 != nil {
+		var default2 uint32
+		return default2, err2
+	}
+
+	// The cleanup via `cabi_post_*` cleans up the memory in the guest. By
+	// deferring this, we ensure that no memory is corrupted before the function
+	// is done accessing it.
+	defer func() {
+		if postFn := i.module.ExportedFunction("cabi_post_borrow-text"); postFn != nil {
+			if _, err := postFn.Call(ctx, raw2...); err != nil {
+				// If we get an error during cleanup, something really bad is
+				// going on, so we panic. Also, you can't return the error from
+				// the `defer`
+				panic(errors.New("failed to cleanup"))
+			}
+		}
+	}()
+
+	results2 := raw2[0]
+	if i.resources.importedCounter.dropBorrows() != 0 {
+		var default3 uint32
+		return default3, errors.New("guest kept a borrowed counter handle after the call returned")
+	}
+	value4, ok4 := i.module.Memory().ReadByte(uint32(results2 + 0))
+	if !ok4 {
+		var default4 uint32
+		return default4, errors.New("failed to read byte from memory")
+	}
+	var value10 uint32
+	var err10 error
+	switch value4 {
+	case 0:
+		value5, ok5 := i.module.Memory().ReadUint32Le(uint32(results2 + 4))
+		if !ok5 {
+			var default5 uint32
+			return default5, errors.New("failed to read i32 from memory")
+		}
+		result6 := uint32(value5)
+		value10 = result6
+	case 1:
+		ptr7, ok7 := i.module.Memory().ReadUint32Le(uint32(results2 + 4))
+		if !ok7 {
+			var default7 uint32
+			return default7, errors.New("failed to read pointer from memory")
+		}
+		len8, ok8 := i.module.Memory().ReadUint32Le(uint32(results2 + 8))
+		if !ok8 {
+			var default8 uint32
+			return default8, errors.New("failed to read length from memory")
+		}
+		buf9, ok9 := i.module.Memory().Read(ptr7, len8)
+		if !ok9 {
+			var default9 uint32
+			return default9, errors.New("failed to read bytes from memory")
+		}
+		str9 := string(buf9)
+		err10 = errors.New(str9)
+	default:
+		err10 = errors.New("invalid variant discriminant for expected")
+	}
+	return value10, err10
+}
+
+func (i *ResourcesInstance) RetainAndTrap(
+	ctx context.Context,
+	c Counter,
+) (uint32, error) {
+	i.dropCollected(ctx)
+	arg0 := c
+	resourcesTransferred := false
+	handle0 := i.resources.importedCounter.add(arg0, true)
+	defer func() {
+		if !resourcesTransferred {
+			i.resources.importedCounter.remove(handle0)
+		}
+	}()
+	resourcesTransferred = true
+	raw1, err1 := i.module.ExportedFunction("retain-and-trap").Call(ctx, uint64(handle0))
+	if err1 != nil {
+		var default1 uint32
+		return default1, err1
+	}
+
+	// The cleanup via `cabi_post_*` cleans up the memory in the guest. By
+	// deferring this, we ensure that no memory is corrupted before the function
+	// is done accessing it.
+	defer func() {
+		if postFn := i.module.ExportedFunction("cabi_post_retain-and-trap"); postFn != nil {
+			if _, err := postFn.Call(ctx, raw1...); err != nil {
+				// If we get an error during cleanup, something really bad is
+				// going on, so we panic. Also, you can't return the error from
+				// the `defer`
+				panic(errors.New("failed to cleanup"))
+			}
+		}
+	}()
+
+	results1 := raw1[0]
+	value2, ok2 := i.module.Memory().ReadByte(uint32(results1 + 0))
+	if !ok2 {
+		var default2 uint32
+		return default2, errors.New("failed to read byte from memory")
+	}
+	var value8 uint32
+	var err8 error
+	switch value2 {
+	case 0:
+		value3, ok3 := i.module.Memory().ReadUint32Le(uint32(results1 + 4))
+		if !ok3 {
+			var default3 uint32
+			return default3, errors.New("failed to read i32 from memory")
+		}
+		result4 := uint32(value3)
+		value8 = result4
+	case 1:
+		ptr5, ok5 := i.module.Memory().ReadUint32Le(uint32(results1 + 4))
+		if !ok5 {
+			var default5 uint32
+			return default5, errors.New("failed to read pointer from memory")
+		}
+		len6, ok6 := i.module.Memory().ReadUint32Le(uint32(results1 + 8))
+		if !ok6 {
+			var default6 uint32
+			return default6, errors.New("failed to read length from memory")
+		}
+		buf7, ok7 := i.module.Memory().Read(ptr5, len6)
+		if !ok7 {
+			var default7 uint32
+			return default7, errors.New("failed to read bytes from memory")
+		}
+		str7 := string(buf7)
+		err8 = errors.New(str7)
+	default:
+		err8 = errors.New("invalid variant discriminant for expected")
+	}
+	return value8, err8
+}
+
+func (i *ResourcesInstance) Retained(
+	ctx context.Context,
+) Counter {
+	i.dropCollected(ctx)
+	raw0, err0 := i.module.ExportedFunction("retained").Call(ctx, )
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err0 != nil {
+		panic(err0)
+	}
+
+	// The cleanup via `cabi_post_*` cleans up the memory in the guest. By
+	// deferring this, we ensure that no memory is corrupted before the function
+	// is done accessing it.
+	defer func() {
+		if postFn := i.module.ExportedFunction("cabi_post_retained"); postFn != nil {
+			if _, err := postFn.Call(ctx, raw0...); err != nil {
+				// If we get an error during cleanup, something really bad is
+				// going on, so we panic. Also, you can't return the error from
+				// the `defer`
+				panic(errors.New("failed to cleanup"))
+			}
+		}
+	}()
+
+	results0 := raw0[0]
+	resource1, ok1 := i.resources.importedCounter.take(uint32(results0))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if !ok1 {
+		panic(errors.New("invalid counter handle"))
+	}
+	return resource1
+}
+
+func (i *ResourcesInstance) TakeText(
+	ctx context.Context,
+	c Counter,
+	text string,
+) (uint32, error) {
+	i.dropCollected(ctx)
+	arg0 := c
+	arg1 := text
+	resourcesTransferred := false
+	handle0 := i.resources.importedCounter.add(arg0, true)
+	defer func() {
+		if !resourcesTransferred {
+			i.resources.importedCounter.remove(handle0)
+		}
+	}()
+	memory1 := i.module.Memory()
+	realloc1 := i.module.ExportedFunction("cabi_realloc")
+	ptr1, len1, err1 := writeString(ctx, arg1, memory1, realloc1)
+	if err1 != nil {
+		var default1 uint32
+		return default1, err1
+	}
+	resourcesTransferred = true
+	raw2, err2 := i.module.ExportedFunction("take-text").Call(ctx, uint64(handle0), uint64(ptr1), uint64(len1))
+	if err2 != nil {
+		var default2 uint32
+		return default2, err2
+	}
+
+	// The cleanup via `cabi_post_*` cleans up the memory in the guest. By
+	// deferring this, we ensure that no memory is corrupted before the function
+	// is done accessing it.
+	defer func() {
+		if postFn := i.module.ExportedFunction("cabi_post_take-text"); postFn != nil {
+			if _, err := postFn.Call(ctx, raw2...); err != nil {
+				// If we get an error during cleanup, something really bad is
+				// going on, so we panic. Also, you can't return the error from
+				// the `defer`
+				panic(errors.New("failed to cleanup"))
+			}
+		}
+	}()
+
+	results2 := raw2[0]
+	value3, ok3 := i.module.Memory().ReadByte(uint32(results2 + 0))
+	if !ok3 {
+		var default3 uint32
+		return default3, errors.New("failed to read byte from memory")
+	}
+	var value9 uint32
+	var err9 error
+	switch value3 {
+	case 0:
+		value4, ok4 := i.module.Memory().ReadUint32Le(uint32(results2 + 4))
+		if !ok4 {
+			var default4 uint32
+			return default4, errors.New("failed to read i32 from memory")
+		}
+		result5 := uint32(value4)
+		value9 = result5
+	case 1:
+		ptr6, ok6 := i.module.Memory().ReadUint32Le(uint32(results2 + 4))
+		if !ok6 {
+			var default6 uint32
+			return default6, errors.New("failed to read pointer from memory")
+		}
+		len7, ok7 := i.module.Memory().ReadUint32Le(uint32(results2 + 8))
+		if !ok7 {
+			var default7 uint32
+			return default7, errors.New("failed to read length from memory")
+		}
+		buf8, ok8 := i.module.Memory().Read(ptr6, len7)
+		if !ok8 {
+			var default8 uint32
+			return default8, errors.New("failed to read bytes from memory")
+		}
+		str8 := string(buf8)
+		err9 = errors.New(str8)
+	default:
+		err9 = errors.New("invalid variant discriminant for expected")
+	}
+	return value9, err9
+}
+
 func (i *ResourcesInstance) Bump(
 	ctx context.Context,
 	c Counter,
@@ -666,6 +1014,7 @@ func (i *ResourcesInstance) Bump(
 	i.dropCollected(ctx)
 	arg0 := c
 	handle0 := i.resources.importedCounter.add(arg0, false)
+	defer i.resources.importedCounter.dropBorrows()
 	raw1, err1 := i.module.ExportedFunction("bump").Call(ctx, uint64(handle0))
 	// The return type doesn't contain an error so we panic if one is encountered
 	if err1 != nil {
@@ -687,7 +1036,14 @@ func (i *ResourcesInstance) Take(
 ) uint32 {
 	i.dropCollected(ctx)
 	arg0 := c
+	resourcesTransferred := false
 	handle0 := i.resources.importedCounter.add(arg0, true)
+	defer func() {
+		if !resourcesTransferred {
+			i.resources.importedCounter.remove(handle0)
+		}
+	}()
+	resourcesTransferred = true
 	raw1, err1 := i.module.ExportedFunction("take").Call(ctx, uint64(handle0))
 	// The return type doesn't contain an error so we panic if one is encountered
 	if err1 != nil {
@@ -705,7 +1061,14 @@ func (i *ResourcesInstance) Roundtrip(
 ) Counter {
 	i.dropCollected(ctx)
 	arg0 := c
+	resourcesTransferred := false
 	handle0 := i.resources.importedCounter.add(arg0, true)
+	defer func() {
+		if !resourcesTransferred {
+			i.resources.importedCounter.remove(handle0)
+		}
+	}()
+	resourcesTransferred = true
 	raw1, err1 := i.module.ExportedFunction("roundtrip").Call(ctx, uint64(handle0))
 	// The return type doesn't contain an error so we panic if one is encountered
 	if err1 != nil {
@@ -1145,12 +1508,31 @@ func (i *ResourcesInstance) AccumulatorCombine(
 	i.dropCollected(ctx)
 	arg0 := a
 	arg1 := b
-	handle0 := i.resources.exportedAccumulator.add(arg0.give(i), true)
-	handle1 := arg1.lend(i)
-	raw2, err2 := i.module.ExportedFunction("arcjet:resources/guest#[static]accumulator.combine").Call(ctx, uint64(handle0), uint64(handle1))
+	resourcesTransferred := false
+	var commitResources []func()
+	reservedResources := make(map[any]bool)
+	ownedResource0 := arg0
+	handle0 := i.resources.exportedAccumulator.add(ownedResource0.lend(i), true)
+	defer func() {
+		if !resourcesTransferred {
+			i.resources.exportedAccumulator.remove(handle0)
+		}
+	}()
 	// The return type doesn't contain an error so we panic if one is encountered
-	if err2 != nil {
-		panic(err2)
+	if reservedResources[ownedResource0] {
+		panic(errors.New("accumulator handle given away more than once"))
+	}
+	reservedResources[ownedResource0] = true
+	commitResources = append(commitResources, func() { ownedResource0.give(i) })
+	handle2 := arg1.lend(i)
+	for _, commit := range commitResources {
+		commit()
+	}
+	resourcesTransferred = true
+	raw3, err3 := i.module.ExportedFunction("arcjet:resources/guest#[static]accumulator.combine").Call(ctx, uint64(handle0), uint64(handle2))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err3 != nil {
+		panic(err3)
 	}
 
 	// The cleanup via `cabi_post_*` cleans up the memory in the guest. By
@@ -1158,7 +1540,7 @@ func (i *ResourcesInstance) AccumulatorCombine(
 	// is done accessing it.
 	defer func() {
 		if postFn := i.module.ExportedFunction("cabi_post_arcjet:resources/guest#[static]accumulator.combine"); postFn != nil {
-			if _, err := postFn.Call(ctx, raw2...); err != nil {
+			if _, err := postFn.Call(ctx, raw3...); err != nil {
 				// If we get an error during cleanup, something really bad is
 				// going on, so we panic. Also, you can't return the error from
 				// the `defer`
@@ -1167,14 +1549,14 @@ func (i *ResourcesInstance) AccumulatorCombine(
 		}
 	}()
 
-	results2 := raw2[0]
-	resource3, ok3 := i.resources.exportedAccumulator.take(uint32(results2))
+	results3 := raw3[0]
+	resource4, ok4 := i.resources.exportedAccumulator.take(uint32(results3))
 	// The return type doesn't contain an error so we panic if one is encountered
-	if !ok3 {
+	if !ok4 {
 		panic(errors.New("invalid accumulator handle"))
 	}
-	wrapped3 := adoptAccumulator(i, resource3)
-	return wrapped3
+	wrapped4 := adoptAccumulator(i, resource4)
+	return wrapped4
 }
 
 func (i *ResourcesInstance) Wrap(
@@ -1254,6 +1636,9 @@ func (i *ResourcesInstance) Unwrap(
 ) uint32 {
 	i.dropCollected(ctx)
 	arg0 := t
+	resourcesTransferred := false
+	var commitResources []func()
+	reservedResources := make(map[any]bool)
 	tag0 := arg0.Tag
 	acc0 := arg0.Acc
 	memory1 := i.module.Memory()
@@ -1263,16 +1648,32 @@ func (i *ResourcesInstance) Unwrap(
 	if err1 != nil {
 		panic(err1)
 	}
-	handle2 := i.resources.exportedAccumulator.add(acc0.give(i), true)
-	raw3, err3 := i.module.ExportedFunction("arcjet:resources/guest#unwrap").Call(ctx, uint64(ptr1), uint64(len1), uint64(handle2))
+	ownedResource2 := acc0
+	handle2 := i.resources.exportedAccumulator.add(ownedResource2.lend(i), true)
+	defer func() {
+		if !resourcesTransferred {
+			i.resources.exportedAccumulator.remove(handle2)
+		}
+	}()
 	// The return type doesn't contain an error so we panic if one is encountered
-	if err3 != nil {
-		panic(err3)
+	if reservedResources[ownedResource2] {
+		panic(errors.New("accumulator handle given away more than once"))
+	}
+	reservedResources[ownedResource2] = true
+	commitResources = append(commitResources, func() { ownedResource2.give(i) })
+	for _, commit := range commitResources {
+		commit()
+	}
+	resourcesTransferred = true
+	raw4, err4 := i.module.ExportedFunction("arcjet:resources/guest#unwrap").Call(ctx, uint64(ptr1), uint64(len1), uint64(handle2))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err4 != nil {
+		panic(err4)
 	}
 
-	results3 := raw3[0]
-	result4 := uint32(results3)
-	return result4
+	results4 := raw4[0]
+	result5 := uint32(results4)
+	return result5
 }
 
 func (i *ResourcesInstance) Hold(
@@ -1338,31 +1739,50 @@ func (i *ResourcesInstance) Weigh(
 ) uint32 {
 	i.dropCollected(ctx)
 	arg0 := h
-	var variant1_0 uint32
-	var variant1_1 uint32
-	switch case1 := arg0.(type) {
+	resourcesTransferred := false
+	var commitResources []func()
+	reservedResources := make(map[any]bool)
+	var variant2_0 uint32
+	var variant2_1 uint32
+	switch case2 := arg0.(type) {
 		case HolderEmpty:
-			_ = case1
-			variant1_0 = 0
-			variant1_1 = 0
+			_ = case2
+			variant2_0 = 0
+			variant2_1 = 0
 		case HolderFull:
-			variantPayload := case1.Value
-			handle0 := i.resources.exportedAccumulator.add(variantPayload.give(i), true)
-			variant1_0 = 1
-			variant1_1 = handle0
+			variantPayload := case2.Value
+			ownedResource0 := variantPayload
+			handle0 := i.resources.exportedAccumulator.add(ownedResource0.lend(i), true)
+			defer func() {
+				if !resourcesTransferred {
+					i.resources.exportedAccumulator.remove(handle0)
+				}
+			}()
+			// The return type doesn't contain an error so we panic if one is encountered
+			if reservedResources[ownedResource0] {
+				panic(errors.New("accumulator handle given away more than once"))
+			}
+			reservedResources[ownedResource0] = true
+			commitResources = append(commitResources, func() { ownedResource0.give(i) })
+			variant2_0 = 1
+			variant2_1 = handle0
 		default:
 			// The return type doesn't contain an error so we panic if one is encountered
 			panic(errors.New("invalid variant type provided"))
 	}
-	raw2, err2 := i.module.ExportedFunction("arcjet:resources/guest#weigh").Call(ctx, uint64(variant1_0), uint64(variant1_1))
+	for _, commit := range commitResources {
+		commit()
+	}
+	resourcesTransferred = true
+	raw3, err3 := i.module.ExportedFunction("arcjet:resources/guest#weigh").Call(ctx, uint64(variant2_0), uint64(variant2_1))
 	// The return type doesn't contain an error so we panic if one is encountered
-	if err2 != nil {
-		panic(err2)
+	if err3 != nil {
+		panic(err3)
 	}
 
-	results2 := raw2[0]
-	result3 := uint32(results2)
-	return result3
+	results3 := raw3[0]
+	result4 := uint32(results3)
+	return result4
 }
 
 func (i *ResourcesInstance) Sum(
@@ -1389,16 +1809,133 @@ func (i *ResourcesInstance) Finish(
 ) uint32 {
 	i.dropCollected(ctx)
 	arg0 := a
-	handle0 := i.resources.exportedAccumulator.add(arg0.give(i), true)
-	raw1, err1 := i.module.ExportedFunction("arcjet:resources/guest#finish").Call(ctx, uint64(handle0))
+	resourcesTransferred := false
+	var commitResources []func()
+	reservedResources := make(map[any]bool)
+	ownedResource0 := arg0
+	handle0 := i.resources.exportedAccumulator.add(ownedResource0.lend(i), true)
+	defer func() {
+		if !resourcesTransferred {
+			i.resources.exportedAccumulator.remove(handle0)
+		}
+	}()
 	// The return type doesn't contain an error so we panic if one is encountered
-	if err1 != nil {
-		panic(err1)
+	if reservedResources[ownedResource0] {
+		panic(errors.New("accumulator handle given away more than once"))
+	}
+	reservedResources[ownedResource0] = true
+	commitResources = append(commitResources, func() { ownedResource0.give(i) })
+	for _, commit := range commitResources {
+		commit()
+	}
+	resourcesTransferred = true
+	raw2, err2 := i.module.ExportedFunction("arcjet:resources/guest#finish").Call(ctx, uint64(handle0))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err2 != nil {
+		panic(err2)
 	}
 
-	results1 := raw1[0]
-	result2 := uint32(results1)
-	return result2
+	results2 := raw2[0]
+	result3 := uint32(results2)
+	return result3
+}
+
+func (i *ResourcesInstance) FinishPair(
+	ctx context.Context,
+	a *Accumulator,
+	b *Accumulator,
+) uint32 {
+	i.dropCollected(ctx)
+	arg0 := a
+	arg1 := b
+	resourcesTransferred := false
+	var commitResources []func()
+	reservedResources := make(map[any]bool)
+	ownedResource0 := arg0
+	handle0 := i.resources.exportedAccumulator.add(ownedResource0.lend(i), true)
+	defer func() {
+		if !resourcesTransferred {
+			i.resources.exportedAccumulator.remove(handle0)
+		}
+	}()
+	// The return type doesn't contain an error so we panic if one is encountered
+	if reservedResources[ownedResource0] {
+		panic(errors.New("accumulator handle given away more than once"))
+	}
+	reservedResources[ownedResource0] = true
+	commitResources = append(commitResources, func() { ownedResource0.give(i) })
+	ownedResource2 := arg1
+	handle2 := i.resources.exportedAccumulator.add(ownedResource2.lend(i), true)
+	defer func() {
+		if !resourcesTransferred {
+			i.resources.exportedAccumulator.remove(handle2)
+		}
+	}()
+	// The return type doesn't contain an error so we panic if one is encountered
+	if reservedResources[ownedResource2] {
+		panic(errors.New("accumulator handle given away more than once"))
+	}
+	reservedResources[ownedResource2] = true
+	commitResources = append(commitResources, func() { ownedResource2.give(i) })
+	for _, commit := range commitResources {
+		commit()
+	}
+	resourcesTransferred = true
+	raw4, err4 := i.module.ExportedFunction("arcjet:resources/guest#finish-pair").Call(ctx, uint64(handle0), uint64(handle2))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err4 != nil {
+		panic(err4)
+	}
+
+	results4 := raw4[0]
+	result5 := uint32(results4)
+	return result5
+}
+
+func (i *ResourcesInstance) FinishText(
+	ctx context.Context,
+	a *Accumulator,
+	text string,
+) uint32 {
+	i.dropCollected(ctx)
+	arg0 := a
+	arg1 := text
+	resourcesTransferred := false
+	var commitResources []func()
+	reservedResources := make(map[any]bool)
+	ownedResource0 := arg0
+	handle0 := i.resources.exportedAccumulator.add(ownedResource0.lend(i), true)
+	defer func() {
+		if !resourcesTransferred {
+			i.resources.exportedAccumulator.remove(handle0)
+		}
+	}()
+	// The return type doesn't contain an error so we panic if one is encountered
+	if reservedResources[ownedResource0] {
+		panic(errors.New("accumulator handle given away more than once"))
+	}
+	reservedResources[ownedResource0] = true
+	commitResources = append(commitResources, func() { ownedResource0.give(i) })
+	memory2 := i.module.Memory()
+	realloc2 := i.module.ExportedFunction("cabi_realloc")
+	ptr2, len2, err2 := writeString(ctx, arg1, memory2, realloc2)
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err2 != nil {
+		panic(err2)
+	}
+	for _, commit := range commitResources {
+		commit()
+	}
+	resourcesTransferred = true
+	raw3, err3 := i.module.ExportedFunction("arcjet:resources/guest#finish-text").Call(ctx, uint64(handle0), uint64(ptr2), uint64(len2))
+	// The return type doesn't contain an error so we panic if one is encountered
+	if err3 != nil {
+		panic(err3)
+	}
+
+	results3 := raw3[0]
+	result4 := uint32(results3)
+	return result4
 }
 
 func (i *ResourcesInstance) Make(
