@@ -60,6 +60,11 @@ cargo install arcjet-gravity
 
 ## Usage
 
+Bindings for resources that the guest implements require Go 1.24 or later because they use `runtime.AddCleanup`.
+Resource-free bindings and bindings for resources that only the host implements do not use this API.
+All bindings must also meet the Go version requirement of the selected wazero release.
+This repository uses Go 1.25 and wazero v1.12.0, which requires Go 1.25.
+
 To generate the bindings, you run something like:
 
 ```bash

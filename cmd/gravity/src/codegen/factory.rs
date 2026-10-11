@@ -70,25 +70,31 @@ impl<'a> FactoryGenerator<'a> {
         };
     }
 
-    /// Generate the Factory struct, constructor, and methods.
+    /// Generate the factory lifecycle, with resource-specific registration when needed.
+    ///
+    /// Host modules are shared by all instances. Resource worlds register each
+    /// instance's tables under its unique module name before its start function
+    /// can call a host function that uses those tables.
     fn generate_factory(&self, tokens: &mut Tokens<Go>) {
         let AnalyzedImports {
             factory_name,
             instance_name,
             constructor_name,
+            resources,
             ..
         } = &self.config.analyzed_imports;
         let wasm_var_name = self.config.wasm_var_name;
-        // Build the parameter list
         let params = self.build_parameters();
-        if let Some(resources) = &self.config.analyzed_imports.resources {
-            return self.generate_factory_with_resources(resources, params, tokens);
-        }
         quote_in! { *tokens =>
             $['\n']
             type $factory_name struct {
                 runtime $WAZERO_RUNTIME
                 module  $WAZERO_COMPILED_MODULE
+                $(if resources.is_some() {
+                    $(comment(&["instances maps a module instance's name to its resource tables."]))
+                    instances *$SYNC_MAP
+                    nextInstance $ATOMIC_UINT64
+                })
             }
             $['\n']
             func $constructor_name(
@@ -97,6 +103,19 @@ impl<'a> FactoryGenerator<'a> {
                 $['\r']
             ) (*$factory_name, error) {
                 wazeroRuntime := $WAZERO_NEW_RUNTIME(ctx)
+
+                $(if let Some(resources) = resources {
+                    $(let tables_name = &resources.tables_name)
+                    instances := &$SYNC_MAP{}
+                    $(comment(&["resourcesOf returns the resource tables of the instance calling a host function."]))
+                    resourcesOf := func(mod $WAZERO_API_MODULE) *$tables_name {
+                        tables, ok := instances.Load(mod.Name())
+                        if !ok {
+                            panic($ERRORS_NEW("module instance has no resource tables"))
+                        }
+                        return tables.(*$tables_name)
+                    }
+                })
 
                 $(for chain in self.config.import_chains.values() =>
                     $chain
@@ -113,112 +132,38 @@ impl<'a> FactoryGenerator<'a> {
                 }
                 return &$factory_name{
                     runtime: wazeroRuntime,
-                    module:  module,
+                    module: module,
+                    $(if resources.is_some() { instances: instances, })
                 }, nil
             }
             $['\n']
             func (f *$factory_name) Instantiate(ctx $CONTEXT_CONTEXT) (*$instance_name, error) {
-                if module, err := f.runtime.InstantiateModule(ctx, f.module, $WAZERO_NEW_MODULE_CONFIG()); err != nil {
-                    return nil, err
-                } else {
-                    return &$instance_name{module}, nil
-                }
-            }
-            $['\n']
-            func (f *$factory_name) Close(ctx $CONTEXT_CONTEXT) {
-                f.runtime.Close(ctx)
-            }
-            $['\n']
-        };
-    }
-
-    /// Generate the Factory struct, constructor, and methods for a world
-    /// with resources.
-    ///
-    /// The Component Model gives every component instance its own handle
-    /// tables. The host modules are instantiated once per factory and shared
-    /// by every instance, so a host function finds the tables of its caller
-    /// by module name: `Instantiate` gives each instance a unique name and
-    /// registers its tables under that name before the module starts.
-    fn generate_factory_with_resources(
-        &self,
-        resources: &AnalyzedResources,
-        params: Tokens<Go>,
-        tokens: &mut Tokens<Go>,
-    ) {
-        let AnalyzedImports {
-            factory_name,
-            instance_name,
-            constructor_name,
-            ..
-        } = &self.config.analyzed_imports;
-        let wasm_var_name = self.config.wasm_var_name;
-        let tables_name = &resources.tables_name;
-        quote_in! { *tokens =>
-            $['\n']
-            type $factory_name struct {
-                runtime $WAZERO_RUNTIME
-                module  $WAZERO_COMPILED_MODULE
-                $(comment(&["instances maps a module instance's name to its resource tables."]))
-                instances *$SYNC_MAP
-                nextInstance $ATOMIC_UINT64
-            }
-            $['\n']
-            func $constructor_name(
-                $['\r']
-                $params
-                $['\r']
-            ) (*$factory_name, error) {
-                wazeroRuntime := $WAZERO_NEW_RUNTIME(ctx)
-
-                instances := &$SYNC_MAP{}
-                $(comment(&["resourcesOf returns the resource tables of the instance calling a host function."]))
-                resourcesOf := func(mod $WAZERO_API_MODULE) *$tables_name {
-                    tables, ok := instances.Load(mod.Name())
-                    if !ok {
-                        panic($ERRORS_NEW("module instance has no resource tables"))
+                $(if let Some(resources) = resources {
+                    $(let tables_name = &resources.tables_name)
+                    $(comment(&[
+                        "The tables are registered before the module starts, because its start",
+                        "function may already call host functions that use them.",
+                    ]))
+                    name := "gravity-" + $STRCONV_FORMAT_UINT(f.nextInstance.Add(1), 10)
+                    resources := &$tables_name{}
+                    f.instances.Store(name, resources)
+                    module, err := f.runtime.InstantiateModule(ctx, f.module, $WAZERO_NEW_MODULE_CONFIG().WithName(name))
+                    if err != nil {
+                        f.instances.Delete(name)
+                        return nil, err
                     }
-                    return tables.(*$tables_name)
-                }
-
-                $(for chain in self.config.import_chains.values() =>
-                    $chain
-                    $['\r']
-                )
-
-                $(comment(&[
-                    "Compiling the module takes a LONG time, so we want to do it once and hold",
-                       "onto it with the Runtime",
-                ]))
-                module, err := wazeroRuntime.CompileModule(ctx, $wasm_var_name)
-                if err != nil {
-                    return nil, err
-                }
-                return &$factory_name{
-                    runtime:   wazeroRuntime,
-                    module:    module,
-                    instances: instances,
-                }, nil
-            }
-            $['\n']
-            func (f *$factory_name) Instantiate(ctx $CONTEXT_CONTEXT) (*$instance_name, error) {
-                $(comment(&[
-                    "The tables are registered before the module starts, because its start",
-                    "function may already call host functions that use them.",
-                ]))
-                name := "gravity-" + $STRCONV_FORMAT_UINT(f.nextInstance.Add(1), 10)
-                resources := &$tables_name{}
-                f.instances.Store(name, resources)
-                module, err := f.runtime.InstantiateModule(ctx, f.module, $WAZERO_NEW_MODULE_CONFIG().WithName(name))
-                if err != nil {
-                    f.instances.Delete(name)
-                    return nil, err
-                }
-                return &$instance_name{
-                    module:    module,
-                    resources: resources,
-                    release:   func() { f.instances.Delete(name) },
-                }, nil
+                    return &$instance_name{
+                        module:    module,
+                        resources: resources,
+                        release:   func() { f.instances.Delete(name) },
+                    }, nil
+                } else {
+                    if module, err := f.runtime.InstantiateModule(ctx, f.module, $WAZERO_NEW_MODULE_CONFIG()); err != nil {
+                        return nil, err
+                    } else {
+                        return &$instance_name{module}, nil
+                    }
+                })
             }
             $['\n']
             func (f *$factory_name) Close(ctx $CONTEXT_CONTEXT) {
@@ -362,6 +307,7 @@ impl<'a> FactoryGenerator<'a> {
                         "collector freed before anyone dropped them.",
                     ]))
                     collectedMu $SYNC_MUTEX
+                    collectedCount $ATOMIC_UINT64
                     collected   []collectedResource
                 })
             }
@@ -392,6 +338,7 @@ impl<'a> FactoryGenerator<'a> {
                 t.collectedMu.Lock()
                 defer t.collectedMu.Unlock()
                 t.collected = append(t.collected, resource)
+                t.collectedCount.Store(uint64(len(t.collected)))
             }
             $['\n']
             $(comment(&[
@@ -399,13 +346,25 @@ impl<'a> FactoryGenerator<'a> {
                 "the garbage collector freed since the last call.",
             ]))
             func (i *$instance_name) dropCollected(ctx $CONTEXT_CONTEXT) {
+                if i.resources.collectedCount.Load() == 0 {
+                    return
+                }
                 i.resources.collectedMu.Lock()
                 collected := i.resources.collected
                 i.resources.collected = nil
+                i.resources.collectedCount.Store(0)
                 i.resources.collectedMu.Unlock()
-                for _, resource := range collected {
+                for index, resource := range collected {
                     if dtor := i.module.ExportedFunction(resource.dtor); dtor != nil {
                         if _, err := dtor.Call(ctx, uint64(resource.rep)); err != nil {
+                            $(comment(&[
+                                "Preserve the unprocessed resources before any new cleanups. The failed",
+                                "destructor can have side effects, so do not retry that resource.",
+                            ]))
+                            i.resources.collectedMu.Lock()
+                            i.resources.collected = append(collected[index+1:], i.resources.collected...)
+                            i.resources.collectedCount.Store(uint64(len(i.resources.collected)))
+                            i.resources.collectedMu.Unlock()
                             panic(err)
                         }
                     }
@@ -415,42 +374,28 @@ impl<'a> FactoryGenerator<'a> {
         };
     }
 
-    /// Generate the Instance struct, and methods.
+    /// Generate the instance lifecycle, with resource-specific fields when needed.
     fn generate_instance(&self, tokens: &mut Tokens<Go>) {
         let instance_name = &self.config.analyzed_imports.instance_name;
-        if let Some(resources) = &self.config.analyzed_imports.resources {
-            let tables_name = &resources.tables_name;
-            quote_in! { *tokens =>
-                type $instance_name struct {
-                    module    $WAZERO_API_MODULE
-                    resources *$tables_name
+        let resources = &self.config.analyzed_imports.resources;
+        quote_in! { *tokens =>
+            type $instance_name struct {
+                module $WAZERO_API_MODULE
+                $(if let Some(resources) = resources {
+                    resources *$(&resources.tables_name)
                     $(comment(&["release removes the instance's resource tables from its factory."]))
-                    release   func()
-                }
-                $['\n']
+                    release func()
+                })
+            }
+            $['\n']
+            $(if resources.is_some() {
                 $(comment(&[
                     "Close closes the module instance. The guest's resources go away with it,",
                     "so handles to them must not be used afterwards.",
                 ]))
-                func (i *$instance_name) Close(ctx $CONTEXT_CONTEXT) error {
-                    defer i.release()
-                    if err := i.module.Close(ctx); err != nil {
-                        return err
-                    }
-
-                    return nil
-                }
-                $['\n']
-            };
-            self.generate_resource_tables(resources, tokens);
-            return;
-        }
-        quote_in! { *tokens =>
-            type $instance_name struct {
-                module $WAZERO_API_MODULE
-            }
-            $['\n']
+            })
             func (i *$instance_name) Close(ctx $CONTEXT_CONTEXT) error {
+                $(if resources.is_some() { defer i.release() })
                 if err := i.module.Close(ctx); err != nil {
                     return err
                 }
@@ -459,6 +404,9 @@ impl<'a> FactoryGenerator<'a> {
             }
             $['\n']
         };
+        if let Some(resources) = resources {
+            self.generate_resource_tables(resources, tokens);
+        }
     }
 
     /// Build parameter list for factory constructor

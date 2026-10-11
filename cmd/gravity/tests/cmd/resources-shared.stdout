@@ -876,6 +876,7 @@ type resourcesSharedResourceTables struct {
 	// collected lists the guest resources whose Go handles the garbage
 	// collector freed before anyone dropped them.
 	collectedMu sync.Mutex
+	collectedCount atomic.Uint64
 	collected []collectedResource
 }
 
@@ -894,18 +895,29 @@ func (t *resourcesSharedResourceTables) collect(resource collectedResource) {
 	t.collectedMu.Lock()
 	defer t.collectedMu.Unlock()
 	t.collected = append(t.collected, resource)
+	t.collectedCount.Store(uint64(len(t.collected)))
 }
 
 // dropCollected runs the guest's destructor for every resource whose handle
 // the garbage collector freed since the last call.
 func (i *ResourcesSharedInstance) dropCollected(ctx context.Context) {
+	if i.resources.collectedCount.Load() == 0 {
+		return
+	}
 	i.resources.collectedMu.Lock()
 	collected := i.resources.collected
 	i.resources.collected = nil
+	i.resources.collectedCount.Store(0)
 	i.resources.collectedMu.Unlock()
-	for _, resource := range collected {
+	for index, resource := range collected {
 		if dtor := i.module.ExportedFunction(resource.dtor); dtor != nil {
 			if _, err := dtor.Call(ctx, uint64(resource.rep)); err != nil {
+				// Preserve the unprocessed resources before any new cleanups. The failed
+				// destructor can have side effects, so do not retry that resource.
+				i.resources.collectedMu.Lock()
+				i.resources.collected = append(collected[index+1:], i.resources.collected...)
+				i.resources.collectedCount.Store(uint64(len(i.resources.collected)))
+				i.resources.collectedMu.Unlock()
 				panic(err)
 			}
 		}
