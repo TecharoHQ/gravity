@@ -26,6 +26,7 @@ pub struct ExportGenerator<'a> {
     /// Whether the guest implements any resource, in which case every export
     /// first destroys the resources whose handles were garbage collected.
     has_guest_resources: bool,
+    exported: ExportedResources,
 }
 
 /// What a generated Go function is a method of.
@@ -39,12 +40,16 @@ enum Receiver<'a> {
 
 impl<'a> ExportGenerator<'a> {
     pub fn new(config: ExportConfig<'a>) -> Self {
-        let has_guest_resources = !crate::exported_resources(config.resolve, config.world)
-            .resources
-            .is_empty();
+        let exported = crate::exported_resources(config.resolve, config.world);
+        Self::with_resources(config, exported)
+    }
+
+    pub(super) fn with_resources(config: ExportConfig<'a>, exported: ExportedResources) -> Self {
+        let has_guest_resources = !exported.resources.is_empty();
         Self {
             config,
             has_guest_resources,
+            exported,
         }
     }
 
@@ -276,7 +281,8 @@ impl<'a> ExportGenerator<'a> {
         // resource the guest implements: those differ on this side and get a
         // second Go type.
         let analyzer =
-            ImportAnalyzer::new(resolve, self.config.world).with_exported(exported.clone());
+            ImportAnalyzer::with_resources(resolve, self.config.world, self.exported.clone())
+                .with_exported(exported.clone());
         for &type_id in interface.types.values() {
             if imported && !exported.types.contains_key(&type_id) {
                 continue;
@@ -384,13 +390,13 @@ impl<'a> ExportGenerator<'a> {
 
 impl FormatInto<Go> for ExportGenerator<'_> {
     fn format_into(self, tokens: &mut Tokens<Go>) {
-        let exported = crate::exported_resources(self.config.resolve, self.config.world);
-        let collisions = self.instance_method_collisions(&exported);
+        let exported = &self.exported;
+        let collisions = self.instance_method_collisions(exported);
         for (key, item) in self.config.world.exports.iter() {
             match item {
                 WorldItem::Function(func) => self.generate_function(func, tokens),
                 WorldItem::Interface { id, .. } => {
-                    self.generate_interface(key, *id, &exported, &collisions, tokens)
+                    self.generate_interface(key, *id, exported, &collisions, tokens)
                 }
                 WorldItem::Type { .. } => todo!("generate type exports"),
             }

@@ -5,7 +5,7 @@ mod func;
 mod imports;
 mod ir;
 #[cfg(test)]
-mod test_wit;
+pub(crate) mod test_wit;
 mod wasm;
 
 pub use bindings::*;

@@ -4,6 +4,7 @@ use genco::{prelude::*, tokens::Tokens};
 use wit_bindgen_core::wit_parser::{Resolve, SizeAlign, World};
 
 use crate::{
+    ExportedResources,
     codegen::{
         ExportGenerator, FactoryGenerator,
         exports::ExportConfig,
@@ -28,6 +29,7 @@ pub struct Bindings<'a> {
 
     /// The sizes of the architecture.
     sizes: &'a SizeAlign,
+    exported: ExportedResources,
 }
 
 impl<'a> Bindings<'a> {
@@ -41,6 +43,7 @@ impl<'a> Bindings<'a> {
             out: Tokens::new(),
             raw_wasm_var: wasm_var,
             sizes,
+            exported: crate::exported_resources(resolve, world),
         }
     }
 
@@ -61,7 +64,8 @@ impl<'a> Bindings<'a> {
 
     /// Generates the imports for the bindings.
     fn generate_imports(&mut self) -> (AnalyzedImports, BTreeMap<String, Tokens<Go>>) {
-        let analyzer = ImportAnalyzer::new(self.resolve, self.world);
+        let analyzer =
+            ImportAnalyzer::with_resources(self.resolve, self.world, self.exported.clone());
         let analyzed = analyzer.analyze();
 
         let generator = ImportCodeGenerator::new(self.resolve, &analyzed, self.sizes);
@@ -96,6 +100,6 @@ impl<'a> Bindings<'a> {
             resolve: self.resolve,
             sizes: self.sizes,
         };
-        ExportGenerator::new(config).format_into(&mut self.out)
+        ExportGenerator::with_resources(config, self.exported.clone()).format_into(&mut self.out)
     }
 }

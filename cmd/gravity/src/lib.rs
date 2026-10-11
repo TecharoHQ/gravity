@@ -1,7 +1,7 @@
 pub mod codegen;
 pub mod go;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::go::GoType;
 use wit_bindgen_core::{
@@ -91,6 +91,11 @@ pub fn qualified_type_name(type_id: TypeId, resolve: &Resolve) -> String {
             && !matches!(other_def.kind, TypeDefKind::Type(_))
     });
 
+    qualify_type_name(type_def, resolve, collides)
+}
+
+fn qualify_type_name(type_def: &TypeDef, resolve: &Resolve, collides: bool) -> String {
+    let name = type_def.name.as_ref().expect("expected named type");
     if !collides {
         return name.clone();
     }
@@ -142,36 +147,41 @@ impl ExportedResources {
 }
 
 /// Whether `typ` holds, at any depth, a handle to one of `resources`.
-fn holds_handle_to(typ: &Type, resolve: &Resolve, resources: &BTreeMap<TypeId, String>) -> bool {
-    let holds = |typ: &Type| holds_handle_to(typ, resolve, resources);
+fn holds_handle_to(
+    typ: &Type,
+    resolve: &Resolve,
+    resources: &BTreeMap<TypeId, String>,
+    memo: &mut BTreeMap<TypeId, bool>,
+) -> bool {
     let Type::Id(id) = typ else {
         return false;
     };
-    match &resolve.types[*id].kind {
+    if let Some(&holds) = memo.get(id) {
+        return holds;
+    }
+    let mut holds = |typ: &Type| holds_handle_to(typ, resolve, resources, memo);
+    let result = match &resolve.types[*id].kind {
         TypeDefKind::Handle(handle) => resources.contains_key(&handle_resource(handle, resolve).0),
         TypeDefKind::Record(record) => record.fields.iter().any(|field| holds(&field.ty)),
-        TypeDefKind::Variant(variant) => variant.cases.iter().any(|case| case.ty.iter().any(holds)),
-        TypeDefKind::Tuple(tuple) => tuple.types.iter().any(holds),
-        TypeDefKind::Result(result) => result.ok.iter().chain(result.err.iter()).any(holds),
+        TypeDefKind::Variant(variant) => variant
+            .cases
+            .iter()
+            .any(|case| case.ty.iter().any(&mut holds)),
+        TypeDefKind::Tuple(tuple) => tuple.types.iter().any(&mut holds),
+        TypeDefKind::Result(result) => result.ok.iter().chain(result.err.iter()).any(&mut holds),
         TypeDefKind::Option(inner)
         | TypeDefKind::List(inner)
         | TypeDefKind::FixedLengthList(inner, _)
         | TypeDefKind::Type(inner) => holds(inner),
         TypeDefKind::Map(key, value) => holds(key) || holds(value),
-        TypeDefKind::Future(inner) | TypeDefKind::Stream(inner) => inner.iter().any(holds),
+        TypeDefKind::Future(inner) | TypeDefKind::Stream(inner) => inner.iter().any(&mut holds),
         TypeDefKind::Resource
         | TypeDefKind::Flags(_)
         | TypeDefKind::Enum(_)
         | TypeDefKind::Unknown => false,
-    }
-}
-
-/// Whether `world` imports the interface `owner`.
-fn world_imports_interface(world: &World, owner: TypeOwner) -> bool {
-    world.imports.values().any(|item| match item {
-        WorldItem::Interface { id, .. } => TypeOwner::Interface(*id) == owner,
-        _ => false,
-    })
+    };
+    memo.insert(*id, result);
+    result
 }
 
 /// The resources declared in the interfaces `world` exports.
@@ -181,6 +191,36 @@ fn world_imports_interface(world: &World, owner: TypeOwner) -> bool {
 /// prefix so the two Go types do not collide.
 pub fn exported_resources(resolve: &Resolve, world: &World) -> ExportedResources {
     let mut exported = ExportedResources::new();
+    let imported_interfaces: BTreeSet<_> = world
+        .imports
+        .values()
+        .filter_map(|item| match item {
+            WorldItem::Interface { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let is_imported = |owner: TypeOwner| match owner {
+        TypeOwner::Interface(id) => imported_interfaces.contains(&id),
+        _ => false,
+    };
+    let mut memo = BTreeMap::new();
+    let mut name_counts = BTreeMap::new();
+    for (_, typ) in resolve.types.iter() {
+        if !matches!(typ.kind, TypeDefKind::Type(_))
+            && let Some(name) = &typ.name
+        {
+            *name_counts.entry(name.as_str()).or_insert(0usize) += 1;
+        }
+    }
+    let type_name = |id| {
+        let typ = &resolve.types[id];
+        let name = typ.name.as_ref().expect("expected named type");
+        qualify_type_name(
+            typ,
+            resolve,
+            name_counts.get(name.as_str()).copied().unwrap_or(0) > 1,
+        )
+    };
     for item in world.exports.values() {
         let WorldItem::Interface { id, .. } = item else {
             continue;
@@ -190,8 +230,8 @@ pub fn exported_resources(resolve: &Resolve, world: &World) -> ExportedResources
             if !matches!(type_def.kind, TypeDefKind::Resource) {
                 continue;
             }
-            let name = qualified_type_name(type_id, resolve);
-            let name = if world_imports_interface(world, type_def.owner) {
+            let name = type_name(type_id);
+            let name = if is_imported(type_def.owner) {
                 format!("exported-{name}")
             } else {
                 name
@@ -211,10 +251,10 @@ pub fn exported_resources(resolve: &Resolve, world: &World) -> ExportedResources
             if matches!(
                 type_def.kind,
                 TypeDefKind::Record(_) | TypeDefKind::Variant(_)
-            ) && world_imports_interface(world, type_def.owner)
-                && holds_handle_to(&Type::Id(type_id), resolve, &exported.resources)
+            ) && is_imported(type_def.owner)
+                && holds_handle_to(&Type::Id(type_id), resolve, &exported.resources, &mut memo)
             {
-                let name = qualified_type_name(type_id, resolve);
+                let name = type_name(type_id);
                 exported.types.insert(type_id, format!("exported-{name}"));
             }
         }
@@ -458,4 +498,53 @@ pub fn resolve_param_type_in(
         }
     }
     resolve_type_in(typ, resolve, exported)
+}
+
+#[cfg(test)]
+mod resource_analysis_tests {
+    use super::*;
+    use crate::codegen::test_wit::Fixture;
+
+    #[test]
+    fn shared_type_graph_caches_positive_and_negative_results() {
+        let fixture = Fixture::parse(
+            "package test:fixture;
+            interface things {
+                resource thing;
+                record leaf { value: u32 }
+                record branch { a: leaf, b: leaf }
+                record diamond { a: branch, b: branch }
+                record held { value: thing }
+                record nested { a: diamond, b: held }
+            }
+            world test-world { import things; export things; }",
+        );
+        let exported = exported_resources(&fixture.resolve, fixture.world());
+        let mut memo = BTreeMap::new();
+        let diamond = Type::Id(fixture.type_id("diamond"));
+        assert!(!holds_handle_to(
+            &diamond,
+            &fixture.resolve,
+            &exported.resources,
+            &mut memo
+        ));
+        let cached = memo.clone();
+        assert!(!holds_handle_to(
+            &diamond,
+            &fixture.resolve,
+            &exported.resources,
+            &mut memo
+        ));
+        assert_eq!(memo, cached);
+        assert_eq!(memo.len(), 3, "each shared record is visited once");
+        let nested = fixture.type_id("nested");
+        assert!(holds_handle_to(
+            &Type::Id(nested),
+            &fixture.resolve,
+            &exported.resources,
+            &mut memo
+        ));
+        assert_eq!(exported.types.get(&nested).unwrap(), "exported-nested");
+        assert!(!exported.types.contains_key(&fixture.type_id("diamond")));
+    }
 }

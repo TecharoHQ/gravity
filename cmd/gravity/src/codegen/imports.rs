@@ -23,7 +23,7 @@ use crate::{
         GoIdentifier, GoResult, GoType,
         imports::{CONTEXT_CONTEXT, ERRORS_NEW, WAZERO_API_MODULE},
     },
-    resolve_nested_type_in, resolve_param_type, resolve_type, resolve_wasm_type,
+    resolve_nested_type_in, resolve_param_type_in, resolve_type_in, resolve_wasm_type,
 };
 
 /// Analyzer for imports - only does analysis, no code generation
@@ -34,14 +34,25 @@ pub struct ImportAnalyzer<'a> {
     /// imports; the export generator sets it to analyze the data types of an
     /// exported interface.
     exported: ExportedResources,
+    guest_resources: ExportedResources,
 }
 
 impl<'a> ImportAnalyzer<'a> {
+    #[cfg(test)]
     pub fn new(resolve: &'a Resolve, world: &'a World) -> Self {
+        Self::with_resources(resolve, world, crate::exported_resources(resolve, world))
+    }
+
+    pub(super) fn with_resources(
+        resolve: &'a Resolve,
+        world: &'a World,
+        guest_resources: ExportedResources,
+    ) -> Self {
         Self {
             resolve,
             world,
             exported: ExportedResources::new(),
+            guest_resources,
         }
     }
 
@@ -125,9 +136,7 @@ impl<'a> ImportAnalyzer<'a> {
             let resources: Vec<_> = self.resolve.interfaces[*id]
                 .types
                 .iter()
-                .filter(|(_, type_id)| {
-                    matches!(self.resolve.types[**type_id].kind, TypeDefKind::Resource)
-                })
+                .filter(|(_, type_id)| self.guest_resources.resources.contains_key(*type_id))
                 .map(|(name, type_id)| {
                     let field = crate::resource_table_field(*type_id, self.resolve, true);
                     (name.clone(), GoIdentifier::private(field))
@@ -265,13 +274,13 @@ impl<'a> ImportAnalyzer<'a> {
             .skip(skip_self)
             .map(|Param { name, ty, .. }| Parameter {
                 name: GoIdentifier::private(name),
-                go_type: resolve_param_type(ty, self.resolve),
+                go_type: resolve_param_type_in(ty, self.resolve, &self.exported),
                 wit_type: *ty,
             })
             .collect();
 
         let return_type = func.result.as_ref().map(|wit_type| WitReturn {
-            go_type: resolve_type(wit_type, self.resolve),
+            go_type: resolve_type_in(wit_type, self.resolve, &self.exported),
             wit_type: *wit_type,
         });
 
@@ -403,7 +412,7 @@ impl<'a> ImportAnalyzer<'a> {
             .iter()
             .map(|Param { name, ty, .. }| Parameter {
                 name: GoIdentifier::private(name),
-                go_type: resolve_param_type(ty, self.resolve),
+                go_type: resolve_param_type_in(ty, self.resolve, &self.exported),
                 wit_type: *ty,
             })
             .collect();
@@ -411,7 +420,7 @@ impl<'a> ImportAnalyzer<'a> {
         let return_type = func
             .result
             .as_ref()
-            .map(|wit_type| resolve_type(wit_type, self.resolve));
+            .map(|wit_type| resolve_type_in(wit_type, self.resolve, &self.exported));
 
         AnalyzedFunction {
             name: func.name.clone(),
@@ -978,6 +987,26 @@ mod tests {
         assert!(chain.contains("Export(\"[resource-rep]thing\")"));
         assert!(chain.contains("Export(\"[resource-drop]thing\")"));
         assert!(chain.contains("ExportedFunction(\"test:fixture/things#[dtor]thing\")"));
+    }
+
+    #[test]
+    fn test_method_analysis_uses_exported_resource_types() {
+        let fixture = Fixture::parse(
+            "package test:fixture;
+            interface things {
+                resource thing;
+                exchange: func(value: thing) -> thing;
+            }
+            world test-world { import things; export things; }",
+        );
+        let exported = crate::exported_resources(&fixture.resolve, fixture.world());
+        let analyzer =
+            ImportAnalyzer::new(&fixture.resolve, fixture.world()).with_exported(exported);
+        let method =
+            analyzer.analyze_interface_method(fixture.function("things", "exchange"), "things");
+        let expected = GoType::Pointer(Box::new(GoType::UserDefined("exported-thing".into())));
+        assert_eq!(method.parameters[0].go_type, expected);
+        assert_eq!(method.return_type.unwrap().go_type, expected);
     }
 
     #[test]
